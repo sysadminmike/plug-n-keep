@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["core", "app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["sysadminmike"]
+repository = "https://github.com/sysadminmike/plug-n-keep"
+readme = "README.md"
+rust-version = "1.100.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# The list lives in clippy.toml: every WPD API that can change the device.
+disallowed_methods = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

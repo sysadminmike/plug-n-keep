@@ -1,0 +1,55 @@
+# Rust build output
+target/
+**/*.rs.bk
+
+# App runtime and state files, should a test run leave them in the tree
+skip_lists.json
+in_progress.json
+instance.lock
+config.json
+*.tmp
+*.pnk-part
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# IDEs and editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.suo
+*.sw?
+*.swp
+
+# Local notes and review drafts
+SECURITY-REVIEW.md
+IDEAS.md
+
+# Python bytecode (tools/*.py)
+__pycache__/
+*.pyc
+
+# Tool output and local assistant settings
+graphify-out/
+.claude/
+
+# Merge leftovers
+*.orig
+*.rej

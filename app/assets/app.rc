@@ -1,0 +1,38 @@
+// Windows resources for plug-n-keep.exe: the icon Explorer shows for the file, the manifest
+// (execution level, DPI awareness, Common Controls v6, long paths, UTF-8) and the version info.
+// Compiled by app/build.rs with windres (GNU toolchain) or rc.exe (MSVC). build.rs writes
+// pnk-version.h (PNK_VERSION_NUM, PNK_VERSION_STR) from the crate version, so it never goes stale.
+#include "pnk-version.h"
+
+1 ICON "icon.ico"
+1 24 "plug-n-keep.exe.manifest"
+
+// 1 = VS_VERSION_INFO, 0x40004 = VOS_NT_WINDOWS32, 1 = VFT_APP (numbers, so no SDK header is needed).
+1 VERSIONINFO
+ FILEVERSION PNK_VERSION_NUM
+ PRODUCTVERSION PNK_VERSION_NUM
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "sysadminmike"
+            VALUE "FileDescription", "Plug-n-Keep: back up USB devices"
+            VALUE "FileVersion", PNK_VERSION_STR
+            VALUE "InternalName", "plug-n-keep"
+            VALUE "LegalCopyright", "Copyright (c) 2026 sysadminmike, MIT licence"
+            VALUE "OriginalFilename", "plug-n-keep.exe"
+            VALUE "ProductName", "Plug-n-Keep"
+            VALUE "ProductVersion", PNK_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

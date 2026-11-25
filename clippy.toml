@@ -1,0 +1,24 @@
+# A device must never be changed. These are the Windows Portable Devices (and COM stream)
+# APIs that can write to, delete from, or send arbitrary commands to a device. Calling any of
+# them is a hard error (disallowed_methods = "deny" in Cargo.toml). This list is the build-time guarantee that the app only reads from a device.
+disallowed-methods = [
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceContent::Delete", reason = "writes to the device" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceContent::Move", reason = "writes to the device" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceContent::Copy", reason = "writes to the device" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceContent::CreateObjectWithPropertiesAndData", reason = "writes to the device" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceContent::CreateObjectWithPropertiesOnly", reason = "writes to the device" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceContent2::UpdateObjectWithPropertiesAndData", reason = "writes to the device" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceProperties::SetValues", reason = "writes to the device" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceProperties::Delete", reason = "writes to the device" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDevicePropertiesBulk::QueueSetValuesByObjectList", reason = "writes to the device" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceResources::CreateResource", reason = "writes to the device" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceResources::Delete", reason = "deletes from the device" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDevice::SendCommand", reason = "arbitrary device commands" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceService::SendCommand", reason = "arbitrary device commands" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceServiceMethods::Invoke", reason = "arbitrary device commands" },
+    { path = "windows::Win32::Devices::PortableDevices::IPortableDeviceServiceMethods::InvokeAsync", reason = "arbitrary device commands" },
+    { path = "windows::Win32::System::Com::ISequentialStream::Write", reason = "writes to a (device) stream" },
+    { path = "windows::Win32::System::Com::IStream::SetSize", reason = "writes to a (device) stream" },
+    { path = "windows::Win32::System::Com::IStream::CopyTo", reason = "writes to a (device) stream" },
+    { path = "windows::Win32::System::Com::IStream::Commit", reason = "writes to a (device) stream" },
+]

@@ -1,0 +1,40 @@
+[package]
+name = "plug-n-keep"
+description = "Backs up a device to a folder on this PC and keeps everything that was ever on it, read-only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "plug-n-keep"
+path = "src/main.rs"
+
+[features]
+# Debug builds only: `--fake-device <folder>` serves a folder as if it were a phone.
+fake-device = ["pnk-core/fake-device"]
+
+[lints]
+workspace = true
+
+[dependencies]
+pnk-core = { path = "../core" }
+# clipboard: copy and paste in the folder and filter boxes.
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow"] }
+egui_extras = { version = "0.37", default-features = false }
+# The logging facade (already used by eframe and egui); app/src/logging.rs is the logger.
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = { version = "0.18", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+# The file dialogs go through the desktop portal on Linux and FreeBSD, so no GTK is needed.
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
+
+[dev-dependencies]
+tempfile = "3"

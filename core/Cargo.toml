@@ -1,0 +1,65 @@
+[package]
+name = "pnk-core"
+description = "Device and backup logic for Plug-n-Keep, without any GUI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pnk_core"
+
+[features]
+# Folder-backed fake device, for the GUI's debug-only fake mode. Never enable in release builds.
+fake-device = []
+
+[lints]
+workspace = true
+
+[dependencies]
+# The logging facade only: the app decides where records go (its Log panel).
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+# Random IDs for devices.
+uuid = { version = "1", default-features = false, features = ["v4"] }
+# Writes the JPG copies of HEIC photos (pure Rust, MIT OR Apache-2.0).
+jpeg-encoder = "0.7.1"
+
+[target.'cfg(windows)'.dependencies]
+# The `implement` macro expands to paths in this crate by name.
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_PortableDevices",
+    "Win32_Foundation",
+    "Win32_Graphics_Imaging",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "implement",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# Plain POSIX calls: renameat2, flock, localtime_r.
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Eject: udisks2 over D-Bus, with the blocking API. Already in the build through the file dialogs.
+zbus = "5"
+
+[dev-dependencies]
+tempfile = "3"
+# Reads back the JPGs the tests make (MIT OR Apache-2.0).
+jpeg-decoder = { version = "0.3", default-features = false }

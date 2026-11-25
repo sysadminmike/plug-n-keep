@@ -1,0 +1,39 @@
+# cargo deny check: advisories, licences, duplicate or wildcard dependencies, and sources.
+# Only the Windows targets count: the app is Windows-only, and crates that are only pulled in on
+# Linux or macOS (e.g. the D-Bus accessibility stack) are never compiled into the exe.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"]
+
+[advisories]
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.9
+# All permissive. OFL-1.1 and Ubuntu-font-1.0 are the fonts egui builds into the exe
+# (epaint_default_fonts): a release should ship their licence texts with the exe.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    # jpeg-encoder: "(MIT OR Apache-2.0) AND IJG". The IJG licence is a permissive BSD-style one.
+    "IJG",
+    "Unicode-3.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Our own path dependencies (pnk-core) are not published, so a path without a version is fine.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
