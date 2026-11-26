@@ -11,10 +11,13 @@
 //! new-device card, the connection is held back ("pending") with nothing learned, and no scan
 //! or sync is possible until the user has answered.
 
+mod bucket;
+
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -26,21 +29,28 @@ use pnk_core::heic::made::{FailedEntry, MadeList};
 use pnk_core::history::{History, SyncRecord};
 use pnk_core::idfile::{self, IdFile};
 use pnk_core::jpgs::{self, JpgEvent, JpgReport};
+use pnk_core::modes::{self, Mode};
 use pnk_core::owner::{self, OwnerState};
 use pnk_core::plan::{self, ScanOptions, ScanPlan, ScanProgress, Status, Summary};
 use pnk_core::platform::{self, DiskSpace, ListedDevice, Session, Transport};
 use pnk_core::registry::{
-    DeviceSettings, KnownDevice, MovedBackup, Registry, SyncSummary, new_device_id,
+    DeviceSettings, FoundBackups, HistoryHome, KnownDevice, MovedBackup, Registry, SyncSummary,
+    new_device_id,
 };
 use pnk_core::signals::{DeviceKind, SignalKind, Signals};
 use pnk_core::space::{self, FolderSizes};
 use pnk_core::state::{Scope, StateDir};
+use pnk_core::store::{BackupStore, Destination, LocalStore, S3Config};
 use pnk_core::sync::{
     ArchiveEvent, ArchiveReport, CopyMode, SyncControl, SyncEvent, SyncItem, SyncReport,
-    archive_removed, archive_stamp, rename_archive, run_sync,
+    archive_removed_in, archive_stamp, rename_archive, run_sync_in,
 };
 
+use bucket::{BucketCtx, ScanResult};
+pub use bucket::{BucketInfo, BucketStatus, SaveOutcome, unavailable_text};
+
 use crate::questions::{self, Answer, Decision, Named, Question, Resolution, WeakSession};
+use crate::s3::{self, TestOutcome};
 
 pub enum Command {
     ListDevices,
@@ -52,7 +62,8 @@ pub enum Command {
     /// session, the source, the scan) is dropped first, but only if it is the open device that is
     /// ejected. Answered with [`Event::Ejected`].
     Eject(ListedDevice),
-    Scan(PathBuf),
+    /// Compare the open device with the backup at this place (a folder or a bucket).
+    Scan(Destination),
     Sync {
         plan_id: u64,
         items: Vec<SyncItem>,
@@ -135,15 +146,29 @@ pub enum Command {
         id: String,
         settings: Box<DeviceSettings>,
     },
-    /// Choose another backup folder for a device.
-    SetBackupDir {
+    /// Choose another backup place (a folder or a bucket) for a device.
+    SetDestination {
         id: String,
-        dir: PathBuf,
+        dest: Destination,
     },
-    /// A device's folder moved: point at the new place. Its marker must say it is the device's.
+    /// A device's backup moved: point at the new place. Its marker must say it is the device's.
     Relocate {
         id: String,
-        dir: PathBuf,
+        dest: Destination,
+    },
+    /// Try a bucket: open it and run the server's self-test. Answered with [`Event::S3Tested`].
+    TestS3 {
+        config: S3Config,
+    },
+    /// Look again at where each S3 device's bucket stands (start, Refresh). Each answer comes as
+    /// [`Event::S3State`].
+    CheckStores,
+    /// Switch between the Local and S3 lists of devices. Only sent while nothing is running.
+    /// The open device, the scan and every other thing held for the old list are let go.
+    SetMode(Mode),
+    /// Throw away an S3 device's modified-time cache; the next scan reads the dates again.
+    RebuildMtimeCache {
+        id: String,
     },
     /// Rename the archive folder on disk, after the scan the window holds.
     RenameArchive {
@@ -153,15 +178,27 @@ pub enum Command {
     /// "Find my backups": read the markers one level under `root`. `apply` adds the devices
     /// found; without it nothing changes.
     FindBackups {
-        root: PathBuf,
+        root: Destination,
         apply: bool,
     },
-    /// "Add an existing backup…": `dir` is a backup folder (it has the marker), or holds some one
-    /// level down. Each device found is added from its folder's own record; one that is known
-    /// with another folder gets this one. Answered with [`Event::Notice`].
+    /// "Add an existing backup…": `dir` is a backup place (it has the marker), or holds some one
+    /// level down. Each device found is added from its own record; one that is known
+    /// with another place gets this one. Answered with [`Event::Notice`].
     AddExisting {
-        dir: PathBuf,
+        dir: Destination,
     },
+    /// S3 mode: look in the bucket again for its devices and settings (start, Refresh, after
+    /// Settings is saved). Answered with [`Event::Bucket`].
+    RefreshBucket,
+    /// S3 mode: write what new devices start with into the bucket, if it is as it was read. The
+    /// connection is already saved on this PC. Answered with [`Event::BucketSaved`].
+    SaveBucketSettings {
+        new_devices: Box<pnk_core::state::NewDeviceDefaults>,
+        /// The connection was changed in the same save.
+        connection_changed: bool,
+    },
+    /// The look at the bucket has an answer (sent by the thread that looked).
+    BucketPoll,
 }
 
 /// What the new-device card gives back.
@@ -169,7 +206,7 @@ pub struct NewDevice {
     /// The listed device the card was filled in for.
     pub device: String,
     pub name: String,
-    pub backup_dir: PathBuf,
+    pub destination: Destination,
     pub settings: DeviceSettings,
     /// Use the ID on the stick (written on another PC) as this device's own.
     pub use_id_file_id: bool,
@@ -180,7 +217,31 @@ pub struct NewDevice {
 pub enum FolderState {
     NotSet,
     Present,
+    /// A folder that isn't there, or a bucket (or its folder) that is gone.
     Missing,
+    /// A bucket not looked at yet (the answer is on its way).
+    Checking,
+    /// A bucket that can't be reached: no network.
+    Offline,
+    /// A bucket that refused the credentials.
+    NoAccess,
+    /// A server that failed the self-test (it ignores conditional writes).
+    ServerUnsupported,
+    /// A bucket that can't be used for another reason (the message says why).
+    Unusable,
+}
+
+impl FolderState {
+    /// A bucket in this state can't be scanned or synced into.
+    pub fn blocks(self) -> bool {
+        matches!(
+            self,
+            FolderState::Offline
+                | FolderState::NoAccess
+                | FolderState::ServerUnsupported
+                | FolderState::Unusable
+        )
+    }
 }
 
 /// How an opened device came to be a known one.
@@ -306,6 +367,19 @@ pub enum Event {
         id: String,
         records: Vec<SyncRecord>,
     },
+    /// Where an S3 device's bucket stands, with a line for the window when it is not fine.
+    S3State {
+        id: String,
+        state: FolderState,
+        detail: String,
+    },
+    /// The answer to [`Command::TestS3`].
+    S3Tested(TestOutcome),
+    /// What the bucket says (S3 mode): where the look at it stands, the settings for new
+    /// devices, the forgotten devices and notes about devices.
+    Bucket(Box<BucketInfo>),
+    /// How a save of the bucket's settings ended.
+    BucketSaved(SaveOutcome),
 }
 
 /// The sizes the device page shows. Each part is `None` when it could not be found out.
@@ -378,30 +452,37 @@ pub struct Fake {
     pub named: bool,
 }
 
+/// Starts the worker. `base` is the settings folder (the Local mode's own state); the S3 mode's
+/// is the `s3` folder inside it. The worker starts on `mode`.
 pub fn spawn(
     ctx: egui::Context,
-    state: StateDir,
+    base: StateDir,
+    mode: Mode,
     fake: Option<Fake>,
     flags: Flags,
 ) -> (Sender<Command>, Receiver<Event>) {
-    spawn_with(ctx, state, fake, flags, pnk_core::platform::eject)
+    spawn_with(ctx, base, mode, fake, flags, pnk_core::platform::eject)
 }
 
 /// [`spawn`] with the system's eject passed in, so a test never ejects anything real.
 fn spawn_with(
     ctx: egui::Context,
-    state: StateDir,
+    base: StateDir,
+    mode: Mode,
     fake: Option<Fake>,
     flags: Flags,
     eject: EjectFn,
 ) -> (Sender<Command>, Receiver<Event>) {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (ev_tx, ev_rx) = mpsc::channel();
+    let wake = cmd_tx.clone();
     std::thread::Builder::new()
         .name("device".into())
         .spawn(move || {
             let out = Out { tx: ev_tx, ctx };
             debug!("The device thread has started");
+            // Temp files an earlier run left behind when it died.
+            pnk_core::heic::sweep_stale_temps();
             let session = match Session::init() {
                 Ok(c) => c,
                 Err(e) => {
@@ -410,8 +491,37 @@ fn spawn_with(
                     return;
                 }
             };
+            let s3_state = match StateDir::open(modes::s3_dir(base.path())) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("The S3 settings folder can't be opened: {e}");
+                    out.send(Event::Devices(Err(format!(
+                        "The S3 settings folder can't be opened: {e}"
+                    ))));
+                    return;
+                }
+            };
+            // The Local state first or second, as the mode says; `other` is the one not in use.
+            let (state, other_state) = match mode {
+                Mode::Local => (base, s3_state),
+                Mode::S3 => (s3_state, base),
+            };
             let registry = Registry::load(&state);
+            let other = Side {
+                registry: Registry::load(&other_state),
+                history: History::new(&other_state),
+                state: other_state,
+            };
+            let (bg_tx, bg_rx) = mpsc::channel();
             let mut w = Worker {
+                bucket: BucketCtx::default(),
+                pushed: HashMap::new(),
+                pushed_ready: false,
+                bg_tx,
+                bg_rx,
+                wake,
+                mode,
+                other,
                 source: None,
                 device: None,
                 weak_match: false,
@@ -430,9 +540,18 @@ fn spawn_with(
                 eject_fn: eject,
                 session,
                 sizes_generation: Arc::new(AtomicU64::new(0)),
+                stores: Mutex::new(Vec::new()),
             };
-            w.recover();
+            // The list first: tidying up after a stop may have to wait for a bucket.
             w.publish();
+            // S3 mode: the bucket's list, on a thread, while the rest of the start-up goes on.
+            w.refresh_bucket();
+            // Both lists are tidied up at start, whichever mode the app opens in.
+            w.swap_sides();
+            w.recover(Some(w.mode_note()));
+            w.swap_sides();
+            w.recover(None);
+            w.check_stores();
             // Ends when the window is gone. Dropping `w` then closes the session before the system session.
             while let Ok(cmd) = cmd_rx.recv() {
                 w.handle(cmd);
@@ -481,7 +600,18 @@ impl Out {
     }
 }
 
+/// One mode's own files and list of devices, kept while the other mode is the one shown.
+struct Side {
+    state: StateDir,
+    history: History,
+    registry: Registry,
+}
+
 struct Worker {
+    /// The mode whose state, history and registry are the fields below.
+    mode: Mode,
+    /// The other mode's, swapped in by [`Worker::set_mode`].
+    other: Side,
     // Field order matters: fields drop in this order, and the session must close before the system session.
     source: Option<Box<dyn DeviceSource>>,
     /// The device `source` was opened from (or last tried), for opening it again.
@@ -514,11 +644,93 @@ struct Worker {
     /// Which walk of a backup folder is the newest ([`Worker::refresh_sizes`]); an older one's
     /// answer is dropped, and forgetting a device makes every walk older.
     sizes_generation: Arc<AtomicU64>,
+    /// The buckets opened so far. Opening reads the credentials and the first use runs the
+    /// server's self-test, so a bucket's store is made once and used again.
+    stores: Mutex<Vec<(S3Config, Arc<dyn BackupStore>)>>,
+    /// S3 mode: what the bucket says and how the look at it stands ([`bucket`]).
+    bucket: BucketCtx,
+    /// S3 mode: each bucket device's record as last written to the bucket or read from it.
+    pushed: HashMap<String, String>,
+    pushed_ready: bool,
+    /// Where the thread that looks in the bucket puts its answer, and how it wakes this one.
+    bg_tx: Sender<ScanResult>,
+    bg_rx: Receiver<ScanResult>,
+    wake: Sender<Command>,
 }
 
 impl Worker {
+    /// The store for a backup place. A folder's is made each time (it is only a path); a
+    /// bucket's is kept ([`Worker::stores`]) until Refresh. An error says what is wrong in words
+    /// for the window (no credentials, a bad setting).
+    fn store_for(&self, dest: &Destination) -> Result<Arc<dyn BackupStore>, String> {
+        let Destination::S3(cfg) = dest else {
+            return dest.open().map(Arc::from);
+        };
+        let mut kept = self.stores.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, s)) = kept.iter().find(|(c, _)| c == cfg) {
+            return Ok(s.clone());
+        }
+        let store: Arc<dyn BackupStore> = dest.open()?.into();
+        kept.push((cfg.clone(), store.clone()));
+        Ok(store)
+    }
+
+    fn forget_stores(&self) {
+        self.stores
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    /// Where the device's backup is, if it has one.
+    fn dest_of(&self, id: &str) -> Option<Destination> {
+        self.registry.get(id).and_then(KnownDevice::destination)
+    }
+
+    /// The place a scan was made against. A scan of a bucket carries its `s3://` address as its
+    /// root, so it only counts while the device is still set to that bucket.
+    fn dest_for(&self, plan: &ScanPlan) -> Result<Destination, String> {
+        match self.dest_of(&plan.device_key) {
+            Some(d @ Destination::S3(_)) if d.label() == plan.root => Ok(d),
+            _ if plan.root.to_string_lossy().starts_with("s3://") => {
+                Err("The scan is out of date. Scan again.".into())
+            }
+            _ => Ok(Destination::Local(plan.root.clone())),
+        }
+    }
+
+    /// Looks at each S3 device's bucket without holding up this thread: one answer per device
+    /// comes as [`Event::S3State`]. The stores are made again first, so a changed credentials
+    /// file is read.
+    fn check_stores(&self) {
+        self.forget_stores();
+        for d in self.registry.devices() {
+            if let Some(dest @ Destination::S3(_)) = d.destination() {
+                self.check_store_async(d.id.clone(), dest, d.last_sync.is_some());
+            }
+        }
+    }
+
+    fn check_store_async(&self, id: String, dest: Destination, had_sync: bool) {
+        let out = self.out.clone();
+        let store = self.store_for(&dest);
+        let spawned = std::thread::Builder::new()
+            .name("bucket-check".into())
+            .spawn(move || {
+                let (state, detail) = match store {
+                    Ok(s) => s3::check_store(&*s, had_sync),
+                    Err(e) => (FolderState::Unusable, s3::open_failure(&e).text()),
+                };
+                out.send(Event::S3State { id, state, detail });
+            });
+        if let Err(e) = spawned {
+            warn!("Could not start the thread that looks at a bucket: {e}");
+        }
+    }
+
     fn handle(&mut self, cmd: Command) {
         debug!("Command received: {}", describe(&cmd));
+        self.drain_bucket();
         match cmd {
             Command::ListDevices => {
                 // A drive plugged in since the last look brings its devices back.
@@ -546,6 +758,8 @@ impl Worker {
                 self.out.send(Event::DeviceHint(self.session.list_hint()));
             }
             Command::Open(device) => {
+                // S3 mode: the bucket's list, not the cache, says which device this is.
+                self.wait_for_bucket();
                 if self.registry.refresh_offline(&self.state) {
                     self.publish();
                 }
@@ -558,7 +772,7 @@ impl Worker {
                 self.drop_session();
             }
             Command::Eject(device) => self.eject(device),
-            Command::Scan(root) => self.scan(root),
+            Command::Scan(dest) => self.scan(dest),
             Command::Sync {
                 plan_id,
                 items,
@@ -575,21 +789,28 @@ impl Worker {
                 self.out.send(Event::Claimed(r));
             }
             Command::SkipAdd { plan_id, entry } => {
-                self.edit_skip_list(plan_id, |state, scope, plan| {
+                self.edit_skip_list(plan_id, |state, scope, store, plan| {
                     let e = plan
                         .entries
                         .get(entry)
                         .ok_or("That file is not in the scan.")?;
-                    state.skip_add(scope, &e.source).map_err(|e| e.to_string())
+                    state
+                        .skip_add_in(scope, store, &e.source)
+                        .map_err(|e| e.to_string())
                 })
             }
-            Command::SkipRemove { plan_id, path } => self
-                .edit_skip_list(plan_id, |state, scope, _| {
-                    state.skip_remove(scope, &path).map_err(|e| e.to_string())
-                }),
-            Command::SkipClear { plan_id } => self.edit_skip_list(plan_id, |state, scope, _| {
-                state.skip_clear(scope).map_err(|e| e.to_string())
-            }),
+            Command::SkipRemove { plan_id, path } => {
+                self.edit_skip_list(plan_id, |state, scope, store, _| {
+                    state
+                        .skip_remove_in(scope, store, &path)
+                        .map_err(|e| e.to_string())
+                })
+            }
+            Command::SkipClear { plan_id } => {
+                self.edit_skip_list(plan_id, |state, scope, store, _| {
+                    state.skip_clear_in(scope, store).map_err(|e| e.to_string())
+                })
+            }
             Command::DiscardPlan => self.plan = None,
             Command::Answer { device, reply } => {
                 if self.is_open_device(&device) {
@@ -628,8 +849,12 @@ impl Worker {
                 self.out.send(Event::History { id, records });
             }
             Command::SetSettings { id, settings } => self.set_settings(&id, *settings),
-            Command::SetBackupDir { id, dir } => self.set_backup_dir(&id, dir),
-            Command::Relocate { id, dir } => self.relocate(&id, &dir),
+            Command::SetDestination { id, dest } => self.set_destination(&id, dest),
+            Command::Relocate { id, dest } => self.relocate(&id, &dest),
+            Command::TestS3 { config } => self.test_s3(config),
+            Command::CheckStores => self.check_stores(),
+            Command::SetMode(mode) => self.set_mode(mode),
+            Command::RebuildMtimeCache { id } => self.rebuild_mtime_cache(&id),
             Command::RenameArchive { plan_id, new_name } => {
                 let r = self.rename_the_archive(plan_id, &new_name);
                 self.out.send(Event::ArchiveRenamed(r));
@@ -637,6 +862,12 @@ impl Worker {
             }
             Command::FindBackups { root, apply } => self.find_backups(&root, apply),
             Command::AddExisting { dir } => self.add_existing(&dir),
+            Command::RefreshBucket => self.refresh_bucket(),
+            Command::SaveBucketSettings {
+                new_devices,
+                connection_changed,
+            } => self.save_bucket_settings(*new_devices, connection_changed),
+            Command::BucketPoll => {}
         }
     }
 
@@ -685,18 +916,63 @@ impl Worker {
         });
     }
 
-    fn recover(&self) {
-        // The record is only acted on inside a backup folder the registry holds for its device.
-        let known = |device: &str| -> Vec<PathBuf> {
-            self.registry
-                .get(device)
-                .and_then(|d| d.backup_dir.clone())
-                .into_iter()
-                .collect()
+    /// The mode's name, to say which list a note is about.
+    fn mode_note(&self) -> &'static str {
+        match self.mode {
+            Mode::Local => "Local mode: ",
+            Mode::S3 => "S3 mode: ",
+        }
+    }
+
+    /// Swap the active mode's files and devices with the other's.
+    fn swap_sides(&mut self) {
+        std::mem::swap(&mut self.state, &mut self.other.state);
+        std::mem::swap(&mut self.history, &mut self.other.history);
+        std::mem::swap(&mut self.registry, &mut self.other.registry);
+        self.mode = match self.mode {
+            Mode::Local => Mode::S3,
+            Mode::S3 => Mode::Local,
         };
-        match self.state.recover_interrupted(&known) {
+    }
+
+    /// The Local / S3 switch: everything held for the old list goes, the other list takes over.
+    fn set_mode(&mut self, mode: Mode) {
+        if mode == self.mode {
+            self.publish();
+            return;
+        }
+        info!("Switching to {} mode", mode.label());
+        self.drop_session();
+        self.weak = WeakSession::default();
+        // Sizes still being worked out belong to the old list.
+        self.sizes_generation.fetch_add(1, AtomicOrdering::Relaxed);
+        self.swap_sides();
+        self.reset_bucket();
+        self.publish();
+        self.check_stores();
+        // S3 mode: the bucket's list and settings (a switch to Local sends nothing).
+        self.refresh_bucket();
+        if self.mode == Mode::Local {
+            self.send_bucket();
+        }
+    }
+
+    fn recover(&self, label: Option<&str>) {
+        let label = label.unwrap_or("");
+        // The record is only acted on inside a backup place (folder or bucket) the registry holds
+        // for its device.
+        let known =
+            |device: &str| -> Vec<Destination> { self.dest_of(device).into_iter().collect() };
+        match self
+            .state
+            .recover_interrupted_for(&known, &|d: &Destination| d.open())
+        {
             Ok(Some(i)) => {
                 let msg = match (&i.record, i.temp_removed) {
+                    (Some(r), _) if i.retry_later => format!(
+                        "The last copy was interrupted ({}). The backup could not be reached, so it is tidied up the next time the app starts with it reachable.",
+                        r.source
+                    ),
                     (Some(r), _) if i.completed => format!(
                         "The last copy was interrupted ({}). The change was finished: {}.",
                         r.source,
@@ -713,15 +989,39 @@ impl Worker {
                     ),
                     (None, _) => format!("{}.", sentence(&i.note)),
                 };
-                self.out.send(Event::Recovered(msg));
+                self.out.send(Event::Recovered(format!("{label}{msg}")));
             }
             Ok(None) => {}
             Err(e) => {
                 warn!("Could not check whether the last copy was interrupted: {e}");
                 self.out.send(Event::Recovered(format!(
-                    "Could not check whether the last copy was interrupted: {e}"
+                    "{label}Could not check whether the last copy was interrupted: {e}"
                 )))
             }
+        }
+        self.clean_stale_uploads();
+    }
+
+    /// Unfinished uploads older than a day in the buckets the app holds are thrown away. On a
+    /// thread of its own: a bucket may be slow or away.
+    fn clean_stale_uploads(&self) {
+        let places: Vec<Destination> = self
+            .registry
+            .devices()
+            .iter()
+            .filter_map(KnownDevice::destination)
+            .filter(|d| matches!(d, Destination::S3(_)))
+            .collect();
+        if places.is_empty() {
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("stale-uploads".into())
+            .spawn(move || {
+                pnk_core::state::clean_stale_uploads(&places, &|d| d.open());
+            });
+        if let Err(e) = spawned {
+            warn!("Could not start the thread that tidies up old uploads: {e}");
         }
     }
 
@@ -740,11 +1040,14 @@ impl Worker {
             .devices()
             .iter()
             .map(|d| {
-                let state = match &d.backup_dir {
-                    None => FolderState::NotSet,
-                    Some(_) if d.offline.is_some() => FolderState::Missing,
-                    Some(p) if p.is_dir() => FolderState::Present,
-                    Some(_) => FolderState::Missing,
+                let state = match (&d.s3, &d.backup_dir) {
+                    // A bucket's state is not worked out here (it takes the network): the window
+                    // has it from `Event::S3State`.
+                    (Some(_), _) => FolderState::Checking,
+                    (None, None) => FolderState::NotSet,
+                    (None, Some(_)) if d.offline.is_some() => FolderState::Missing,
+                    (None, Some(p)) if p.is_dir() => FolderState::Present,
+                    (None, Some(_)) => FolderState::Missing,
                 };
                 (d.id.clone(), state)
             })
@@ -756,7 +1059,9 @@ impl Worker {
     }
 
     /// Save the list of known devices; say so if it can't be.
-    fn save_registry(&self) -> bool {
+    fn save_registry(&mut self) -> bool {
+        // S3 mode: the record is the bucket's; what is saved here is the cache of it.
+        self.push_records();
         match self.registry.save(&self.state) {
             Ok(()) => true,
             Err(e) => {
@@ -778,16 +1083,30 @@ impl Worker {
     /// The device's sync history: from its backup folder, or, if it has no record there yet, from
     /// the settings folder.
     fn history_load(&self, id: &str) -> Vec<SyncRecord> {
-        match self.registry.history_file(id) {
-            Some(path) => pnk_core::history::load_at(&path),
-            None => self.history.load(id),
+        match self.registry.history_home(id) {
+            HistoryHome::Folder(path) => pnk_core::history::load_at(&path),
+            HistoryHome::Store(dest) => match self.store_for(&dest) {
+                Ok(store) => load_history_in(&*store),
+                Err(e) => {
+                    warn!(
+                        "Could not read the sync history in {}: {e}",
+                        dest.label().display()
+                    );
+                    Vec::new()
+                }
+            },
+            HistoryHome::Profile => self.history.load(id),
         }
     }
 
     fn history_append(&self, id: &str, record: &SyncRecord) -> std::io::Result<()> {
-        match self.registry.history_file(id) {
-            Some(path) => pnk_core::history::append_at(&path, record),
-            None => self.history.append(id, record),
+        match self.registry.history_home(id) {
+            HistoryHome::Folder(path) => pnk_core::history::append_at(&path, record),
+            HistoryHome::Store(dest) => {
+                let store = self.store_for(&dest).map_err(std::io::Error::other)?;
+                append_history_in(&*store, record)
+            }
+            HistoryHome::Profile => self.history.append(id, record),
         }
     }
 
@@ -1069,11 +1388,8 @@ impl Worker {
         let name = new.name.trim().to_string();
         let problem = if name.is_empty() {
             Some("Give the device a name.".to_string())
-        } else if !new.backup_dir.is_absolute() {
-            Some(format!(
-                "Enter the backup folder's full path, such as {}.",
-                crate::format::example_folder()
-            ))
+        } else if let Some(why) = self.destination_problem(None, &new.destination) {
+            Some(why)
         } else {
             crate::validate::check_settings(&new.settings, &[])
                 .into_iter()
@@ -1106,17 +1422,19 @@ impl Worker {
         let now = pnk_core::utc_stamp();
         let mut d = KnownDevice::with_id(id.clone(), p.kind, &name, &signals, &now);
         d.view = Some(p.identity.view);
-        d.backup_dir = Some(new.backup_dir);
+        d.set_destination(new.destination.clone());
         d.settings = new.settings;
+        no_bin_in_a_bucket(&mut d);
         info!(
             "Set up \"{name}\" as a new {} backing up to {}",
             p.kind.label(),
-            d.backup_dir
-                .as_ref()
-                .map_or_else(String::new, |b| b.display().to_string())
+            new.destination.label().display()
         );
         self.registry.add(d);
         self.save_registry();
+        if matches!(new.destination, Destination::S3(_)) {
+            self.check_store_async(id.clone(), new.destination, false);
+        }
         self.bind(p.inner, &id, None, signals);
         self.emit(Stage::Ready {
             device_id: id,
@@ -1241,6 +1559,9 @@ impl Worker {
         if let Some(why) = self.offline_reason(id) {
             return self.notice(Err(format!("Not renamed: {why}")));
         }
+        if let Some(why) = self.bucket_blocks_changes(id) {
+            return self.notice(Err(format!("Not renamed: {why}")));
+        }
         if let Some(d) = self.registry.get_mut(id) {
             info!("Renamed \"{}\" to \"{name}\"", d.name);
             d.name = name.to_string();
@@ -1250,6 +1571,15 @@ impl Worker {
     }
 
     fn forget(&mut self, id: &str) {
+        if self.registry.get(id).is_none() {
+            return;
+        }
+        // S3 mode: forgotten for every PC that uses the bucket.
+        if self.mode == Mode::S3
+            && let Err(e) = self.forget_in_bucket(id)
+        {
+            return self.notice(Err(e));
+        }
         let Some(d) = self.registry.forget(id) else {
             return;
         };
@@ -1260,11 +1590,15 @@ impl Worker {
         self.weak.forget(id);
         // A size walk still running for it has nothing to report to.
         self.sizes_generation.fetch_add(1, AtomicOrdering::SeqCst);
+        self.pushed.remove(id);
         self.save_registry();
         self.notice(Ok(format!(
             "Forgot \"{}\". Its backup folder and the device itself were not touched.",
             d.name
         )));
+        if self.mode == Mode::S3 {
+            self.send_bucket();
+        }
         if self.bound.as_ref().is_some_and(|b| b.device_id == id)
             && let Some(device) = self.device.clone()
         {
@@ -1285,9 +1619,15 @@ impl Worker {
         if let Some(why) = self.offline_reason(id) {
             return self.notice(Err(format!("Not saved: {why}")));
         }
+        if let Some(why) = self.bucket_blocks_changes(id) {
+            return self.notice(Err(format!("Not saved: {why}")));
+        }
         let Some(d) = self.registry.get_mut(id) else {
             return;
         };
+        if d.s3.is_some() {
+            settings.deleted_files = fit_for_bucket(settings.deleted_files);
+        }
         // Chosen by the first scan, not by the user.
         settings.storage_layout = d.settings.storage_layout;
         settings.top_level_storage = d.settings.top_level_storage.clone();
@@ -1305,87 +1645,132 @@ impl Worker {
         self.publish();
     }
 
-    fn set_backup_dir(&mut self, id: &str, dir: PathBuf) {
-        if !dir.is_absolute() {
-            return self.notice(Err(format!(
+    /// Why `dest` can't be the backup place of the device `own` (or of a device being set up,
+    /// `None`), if it can't: a folder must be a full path, and a place in a bucket may not
+    /// overlap another known device's.
+    fn destination_problem(&self, own: Option<&str>, dest: &Destination) -> Option<String> {
+        match dest {
+            Destination::Local(dir) if !dir.is_absolute() => Some(format!(
                 "Enter the backup folder's full path, such as {}.",
                 crate::format::example_folder()
-            )));
+            )),
+            _ => None,
         }
-        if let Some(d) = self.registry.get(id) {
-            info!(
-                "The backup folder of \"{}\" is now {}",
-                d.name,
-                dir.display()
-            );
-            // The record goes into the new folder, and the history is copied across; the old
-            // folder's files stay where they are.
-            if let Err(e) = self.registry.set_backup_dir(&self.state, id, dir) {
-                warn!("{e}");
-                self.notice(Err(e));
-            }
-            if self.plan.as_ref().is_some_and(|(_, p)| p.device_key == id) {
-                self.plan = None;
-            }
-            self.save_registry();
-            self.publish();
-        }
+        .or_else(|| {
+            // S3 mode: directly inside the base folder, so other PCs find it.
+            (self.mode == Mode::S3)
+                .then(|| self.s3_place_problem(dest))
+                .flatten()
+        })
+        .or_else(|| {
+            s3::overlapping_device(self.registry.devices(), own, dest)
+                .map(|d| s3::overlap_text(&d.name))
+        })
     }
 
-    /// Whether the folder `dir` may become the backup folder of the device `id`, whose folder
-    /// moved: its marker must say it is this device's.
-    fn check_relocation(&self, id: &str, dir: &Path) -> Result<(), String> {
-        let name = self
-            .registry
-            .get(id)
-            .map_or_else(String::new, |d| d.name.clone());
-        match owner::read(dir) {
-            OwnerState::Owned(m) if m.device_id == id => Ok(()),
-            OwnerState::Owned(m) => Err(format!(
-                "That folder belongs to \"{}\", not to \"{name}\".",
-                m.device_name
-            )),
-            OwnerState::Unclaimed => Err(format!(
-                "That folder has no {} file, so it can't be confirmed as \"{name}\"'s backup. Pick the folder that was moved, with its files.",
-                owner::MARKER
-            )),
-            OwnerState::Unreadable(e) => {
-                Err(format!("The marker in that folder can't be read ({e})."))
-            }
+    fn set_destination(&mut self, id: &str, dest: Destination) {
+        if let Some(why) = self.destination_problem(Some(id), &dest) {
+            return self.notice(Err(why));
         }
-    }
-
-    /// The folder moved: its marker must say it is this device's. The record in the folder, if
-    /// it has one, is the device's from now on (it is the source of truth). Returns the device's
-    /// name if it was moved.
-    fn relocate_checked(&mut self, id: &str, dir: &Path) -> Result<String, String> {
-        self.check_relocation(id, dir)?;
-        let name = self
-            .registry
-            .get(id)
-            .map_or_else(String::new, |d| d.name.clone());
-        if let Some(problem) = self.registry.rehome(id, dir) {
-            warn!("{problem}");
+        let Some(d) = self.registry.get(id) else {
+            return;
+        };
+        info!(
+            "The backup of \"{}\" is now {}",
+            d.name,
+            dest.label().display()
+        );
+        let is_bucket = matches!(dest, Destination::S3(_));
+        if is_bucket && let Some(d) = self.registry.get_mut(id) {
+            d.settings.deleted_files = fit_for_bucket(d.settings.deleted_files);
         }
-        // A scan held for this device was made against the old folder: drop it (the
-        // window drops its copy when it sees the new folder), as a folder change does.
+        // The record goes into the new place, and the history is copied across; the old
+        // place's files stay where they are.
+        if let Err(e) = self.registry.set_destination(&self.state, id, dest.clone()) {
+            warn!("{e}");
+            self.notice(Err(e));
+        }
         if self.plan.as_ref().is_some_and(|(_, p)| p.device_key == id) {
             self.plan = None;
         }
-        info!("The backup of \"{name}\" is now found at {}", dir.display());
         self.save_registry();
+        self.publish();
+        if is_bucket {
+            // A new place has nothing synced into it yet, so nothing in it can be "gone".
+            self.check_store_async(id.to_string(), dest, false);
+        }
+    }
+
+    /// Looks at the marker at a place the user says the device's backup moved to.
+    fn check_relocation(&self, id: &str, dest: &Destination) -> Result<(), String> {
+        let name = self
+            .registry
+            .get(id)
+            .map_or_else(String::new, |d| d.name.clone());
+        let store = self
+            .store_for(dest)
+            .map_err(|e| s3::open_failure(&e).text())?;
+        let what = if matches!(dest, Destination::S3(_)) {
+            "place"
+        } else {
+            "folder"
+        };
+        match owner::read_in(&*store) {
+            OwnerState::Owned(m) if m.device_id == id => Ok(()),
+            OwnerState::Owned(m) => Err(format!(
+                "That {what} belongs to \"{}\", not to \"{name}\".",
+                m.device_name
+            )),
+            OwnerState::Unclaimed => Err(format!(
+                "That {what} has no {} file, so it can't be confirmed as \"{name}\"'s backup. Pick the {what} that was moved, with its files.",
+                owner::MARKER
+            )),
+            OwnerState::Unreadable(e) => {
+                Err(format!("The marker in that {what} can't be read ({e})."))
+            }
+        }
+    }
+
+    /// The backup moved: its marker must say it is this device's. The record there, if it has
+    /// one, is the device's from now on (it is the source of truth). Returns the device's name
+    /// if it was moved.
+    fn relocate_checked(&mut self, id: &str, dest: &Destination) -> Result<String, String> {
+        if let Some(why) = self.destination_problem(Some(id), dest) {
+            return Err(why);
+        }
+        self.check_relocation(id, dest)?;
+        let name = self
+            .registry
+            .get(id)
+            .map_or_else(String::new, |d| d.name.clone());
+        if let Some(problem) = self.registry.rehome_dest(id, dest) {
+            warn!("{problem}");
+        }
+        // A scan held for this device was made against the old place: drop it (the
+        // window drops its copy when it sees the new place), as a change does.
+        if self.plan.as_ref().is_some_and(|(_, p)| p.device_key == id) {
+            self.plan = None;
+        }
+        info!(
+            "The backup of \"{name}\" is now found at {}",
+            dest.label().display()
+        );
+        self.save_registry();
+        if matches!(dest, Destination::S3(_)) {
+            self.check_store_async(id.to_string(), dest.clone(), false);
+        }
         Ok(name)
     }
 
-    fn relocate(&mut self, id: &str, dir: &Path) {
+    fn relocate(&mut self, id: &str, dest: &Destination) {
         if self.registry.get(id).is_none() {
             return;
         }
-        match self.relocate_checked(id, dir) {
+        match self.relocate_checked(id, dest) {
             Ok(name) => {
                 let name = self.registry.get(id).map_or(name, |d| d.name.clone());
                 self.notice(Ok(format!(
-                    "Found the backup of \"{name}\": its marker confirms the folder."
+                    "Found the backup of \"{name}\": its marker confirms the place."
                 )));
                 self.publish();
             }
@@ -1393,15 +1778,67 @@ impl Worker {
         }
     }
 
+    /// What is looked at for "Find my backups" and "Add an existing backup…": a folder is read
+    /// by the registry; a bucket by core's `find_backups`.
+    fn look_for_backups(
+        &self,
+        registry: &mut Registry,
+        place: &Destination,
+        now: &str,
+    ) -> FoundBackups {
+        match place {
+            Destination::Local(dir) => registry.find_my_backups(dir, now),
+            Destination::S3(_) => {
+                let mut found = FoundBackups::default();
+                match pnk_core::store::find::find_backups(place) {
+                    Ok(list) => {
+                        for f in list {
+                            // A damaged record is rebuilt from the marker; say so.
+                            if let Some(why) = &f.record_problem {
+                                found.problems.push(format!(
+                                    "The record of \"{}\" in {} can't be used ({why}); it was rebuilt from the marker",
+                                    f.device_name,
+                                    f.destination.label().display()
+                                ));
+                            }
+                            registry.found_in_store(
+                                &f.destination,
+                                &f.device_id,
+                                &f.device_name,
+                                now,
+                                &mut found,
+                            );
+                        }
+                    }
+                    Err(e) => found.problems.push(e),
+                }
+                found
+            }
+        }
+    }
+
     /// "Add an existing backup…": see [`Command::AddExisting`].
-    fn add_existing(&mut self, dir: &Path) {
+    fn add_existing(&mut self, dir: &Destination) {
+        if self.mode == Mode::S3 {
+            return self.bucket_add_existing();
+        }
         self.registry.refresh_offline(&self.state);
         let now = pnk_core::utc_stamp();
-        let report = self.registry.find_my_backups(dir, &now);
+        let place = dir.label().display().to_string();
+        let report = {
+            let mut real = std::mem::take(&mut self.registry);
+            let report = self.look_for_backups(&mut real, dir, &now);
+            self.registry = real;
+            report
+        };
         let mut relocated = Vec::new();
         let mut problems = report.problems.clone();
         for m in &report.moved {
-            match self.relocate_checked(&m.device_id, &m.found) {
+            let to = m
+                .destination
+                .clone()
+                .unwrap_or_else(|| Destination::Local(m.found.clone()));
+            match self.relocate_checked(&m.device_id, &to) {
                 Ok(_) => relocated.push(
                     self.registry
                         .get(&m.device_id)
@@ -1423,7 +1860,7 @@ impl Worker {
         }
         if !relocated.is_empty() {
             parts.push(format!(
-                "Now using this folder for {}.",
+                "Now using this place for {}.",
                 relocated.join(", ")
             ));
         }
@@ -1434,15 +1871,10 @@ impl Worker {
             ));
         }
         parts.extend(problems.iter().map(|p| format!("{p}.")));
-        info!(
-            "Added existing backups from {}: {}",
-            dir.display(),
-            parts.join(" ")
-        );
+        info!("Added existing backups from {place}: {}", parts.join(" "));
         self.notice(if n == 0 && problems.is_empty() {
             Err(format!(
-                "No backup found in {}. A backup folder has a {} file; this folder doesn't, and neither do the folders directly inside it.",
-                dir.display(),
+                "No backup found in {place}. A backup has a {} file; this place doesn't, and neither do the folders directly inside it.",
                 owner::MARKER
             ))
         } else if n == 0 {
@@ -1451,10 +1883,17 @@ impl Worker {
             Ok(parts.join(" "))
         });
         self.publish();
+        self.check_stores();
     }
 
     fn rename_the_archive(&mut self, plan_id: u64, new_name: &str) -> Result<String, String> {
         let plan = self.current_plan(plan_id)?;
+        if matches!(self.dest_for(&plan)?, Destination::S3(_)) {
+            return Err(
+                "The archive folder can't be renamed in a bucket: that would copy every file in it."
+                    .into(),
+            );
+        }
         let old = plan.archive_name.clone();
         let done = rename_archive(&plan, new_name).map_err(|e| e.to_string())?;
         if let Some(d) = self.registry.get_mut(&plan.device_key) {
@@ -1471,14 +1910,28 @@ impl Worker {
         })
     }
 
-    fn find_backups(&mut self, root: &Path, apply: bool) {
+    fn find_backups(&mut self, root: &Destination, apply: bool) {
+        if self.mode == Mode::S3 {
+            let found = self.bucket_find(apply);
+            self.out.send(Event::Found(Box::new(found)));
+            if apply {
+                self.publish();
+                self.send_bucket();
+                self.check_stores();
+            }
+            return;
+        }
         self.registry.refresh_offline(&self.state);
         let now = pnk_core::utc_stamp();
         let report = if apply {
-            self.registry.find_my_backups(root, &now)
+            let mut real = std::mem::take(&mut self.registry);
+            let report = self.look_for_backups(&mut real, root, &now);
+            self.registry = real;
+            report
         } else {
             // Only a look: the real list is not touched.
-            Registry::new(self.registry.devices().to_vec()).find_my_backups(root, &now)
+            let mut copy = Registry::new(self.registry.devices().to_vec());
+            self.look_for_backups(&mut copy, root, &now)
         };
         if apply {
             self.save_registry();
@@ -1492,7 +1945,50 @@ impl Worker {
         })));
         if apply {
             self.publish();
+            self.check_stores();
         }
+    }
+
+    /// "Test" in the device set-up and Settings: opens the bucket and runs the server's
+    /// self-test, on a thread of its own, and says what it found. Never shows a key.
+    fn test_s3(&self, config: S3Config) {
+        let out = self.out.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bucket-test".into())
+            .spawn(move || {
+                let outcome = match Destination::S3(config).open() {
+                    Ok(store) => {
+                        let outcome = s3::test_outcome(&store.root_exists());
+                        match (outcome, store.server_note()) {
+                            (TestOutcome::Ok, Some(note)) => TestOutcome::OkWithNote(note),
+                            (outcome, _) => outcome,
+                        }
+                    }
+                    Err(e) => s3::open_failure(&e),
+                };
+                out.send(Event::S3Tested(outcome));
+            });
+        if let Err(e) = spawned {
+            warn!("Could not start the thread that tests a bucket: {e}");
+            self.out
+                .send(Event::S3Tested(TestOutcome::Other(e.to_string())));
+        }
+    }
+
+    /// "Rebuild modified-time cache": the next scan reads every file's date again.
+    fn rebuild_mtime_cache(&self, id: &str) {
+        let result = (|| -> Result<String, String> {
+            let Some(dest @ Destination::S3(_)) = self.dest_of(id) else {
+                return Err("Only a backup in a bucket has a modified-time cache.".into());
+            };
+            let store = self
+                .store_for(&dest)
+                .map_err(|e| s3::open_failure(&e).text())?;
+            pnk_core::store::mtimes::forget_cache(&*store)
+                .map_err(|e| format!("The cache could not be reset: {e}"))?;
+            Ok("The next scan reads every file's date again, then saves a fresh cache.".into())
+        })();
+        self.notice(result);
     }
 
     fn open_unguarded(&self, device: &ListedDevice) -> Result<Box<dyn DeviceSource>, String> {
@@ -1526,27 +2022,49 @@ impl Worker {
             .unwrap_or_default()
     }
 
-    fn scan(&mut self, root: PathBuf) {
+    /// Looks at a device's bucket before a scan, tells the window what it found, and says what
+    /// stops the scan if something does. Runs on this thread (the scan is about to use the
+    /// network anyway).
+    fn bucket_problem(&self, id: &str, store: &dyn BackupStore, root: &Path) -> Option<String> {
+        let had_sync = self.registry.get(id).is_some_and(|d| d.last_sync.is_some());
+        let (state, detail) = s3::check_store(store, had_sync);
+        self.out.send(Event::S3State {
+            id: id.to_string(),
+            state,
+            detail: detail.clone(),
+        });
+        match state {
+            FolderState::Present => None,
+            FolderState::Missing => Some(format!(
+                "Backup not found: {}. {detail} Use Find it… if it was moved, or Change… to start a new backup place.",
+                root.display()
+            )),
+            _ => Some(detail),
+        }
+    }
+
+    fn scan(&mut self, dest: Destination) {
         self.plan = None;
         let listed = self.listed_id();
         let failed = |message: String| Event::ScanFailed {
             listed: listed.clone(),
             message,
         };
-        let Some(src) = self.source.as_mut() else {
+        let Some(scope_key) = self.source.as_ref().map(|s| s.identity().key.clone()) else {
             warn!("Scan refused: no device is open");
             return self
                 .out
                 .send(failed("No device is open. Click Refresh.".into()));
         };
-        if !root.is_absolute() {
+        if let Destination::Local(root) = &dest
+            && !root.is_absolute()
+        {
             warn!("Scan refused: {} is not a full path", root.display());
             return self.out.send(failed(format!(
                 "Enter the backup folder's full path, such as {}.",
                 crate::format::example_folder()
             )));
         }
-        let scope_key = src.identity().key.clone();
         if let Some(why) = self
             .registry
             .get(&scope_key)
@@ -1557,14 +2075,29 @@ impl Worker {
                 "{why}. Plug the drive in, or use Find it… to point to the folder."
             )));
         }
-        let scope = Scope::new(&scope_key, &root);
-        let skip = match self.state.skip_list(&scope) {
+        let store = match self.store_for(&dest) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Scan refused: {e}");
+                return self.out.send(failed(s3::open_failure(&e).text()));
+            }
+        };
+        let root = dest.label();
+        if matches!(dest, Destination::S3(_))
+            && let Some(why) = self.bucket_problem(&scope_key, &*store, &root)
+        {
+            warn!("Scan refused: {why}");
+            return self.out.send(failed(why));
+        }
+        let scope = Scope::in_store(&scope_key, &*store, &root);
+        let skip = match self.state.skip_list_in(&scope, &*store) {
             Ok(s) => s,
             Err(e) => {
                 error!("Scan refused: could not read the skip list: {e}");
-                return self
-                    .out
-                    .send(failed(format!("Could not read the skip list: {e}")));
+                return self.out.send(failed(format!(
+                    "Could not read the skip list: {}",
+                    pnk_core::store::explain(&e)
+                )));
             }
         };
         // The device's own settings, from its entry in the registry.
@@ -1585,8 +2118,12 @@ impl Worker {
                 out.send(Event::ScanProgress(p));
             }
         };
-        match plan::scan(
+        let Some(src) = self.source.as_mut() else {
+            return;
+        };
+        match plan::scan_in(
             src.as_mut(),
+            &*store,
             &root,
             &skip,
             &opts,
@@ -1671,6 +2208,10 @@ impl Worker {
             if let Some(why) = self.offline_reason(&plan.device_key) {
                 return Err(why);
             }
+            let dest = self.dest_for(&plan)?;
+            let store = self
+                .store_for(&dest)
+                .map_err(|e| s3::open_failure(&e).text())?;
             let src = self
                 .source
                 .as_mut()
@@ -1692,7 +2233,8 @@ impl Worker {
             // One dated archive folder for the whole sync: changed files' old copies and the
             // files deleted from the device go into the same one.
             let stamp = archive_stamp();
-            let copy = run_sync(
+            let copy = run_sync_in(
+                &*store,
                 src.as_mut(),
                 &plan,
                 &items,
@@ -1708,14 +2250,19 @@ impl Worker {
                 && !copy.disk_full
                 && copy.connection_lost.is_none();
             let archive = (archive && finished && !plan.removed.is_empty()).then(|| {
-                archive_removed(&plan, &stamp, confirmed, &mut |ev| {
-                    out.send(Event::Archive(ev))
-                })
+                archive_removed_in(
+                    &*store,
+                    &plan,
+                    &stamp,
+                    confirmed,
+                    Some(&self.state),
+                    &mut |ev| out.send(Event::Archive(ev)),
+                )
                 .map_err(|e| e.to_string())
             });
             // The JPG step, last: after the copying and the archiving, never failing the sync.
             let jpg = (plan.jpg.enabled && finished).then(|| {
-                jpgs::make_jpegs(&plan, &self.flags.sync.cancel, &mut |ev| {
+                jpgs::make_jpegs_in(&*store, &plan, &self.flags.sync.cancel, &mut |ev| {
                     out.send(Event::Jpg(ev))
                 })
                 .map_err(|e| e.to_string())
@@ -1724,8 +2271,9 @@ impl Worker {
         })();
         if let Ok(plan) = self.current_plan(plan_id)
             && plan.jpg.enabled
+            && let Ok(store) = self.dest_for(&plan).and_then(|d| self.store_for(&d))
         {
-            self.send_jpg_failures(&plan.device_key, &plan.root);
+            self.send_jpg_failures(&plan.device_key, &*store);
         }
         if let Ok(o) = &result {
             let archived = match &o.archive {
@@ -1793,10 +2341,10 @@ impl Worker {
     }
 
     /// Tells the window which HEICs have no JPG copy, as the made list in `root` has them.
-    fn send_jpg_failures(&self, id: &str, root: &Path) {
+    fn send_jpg_failures(&self, id: &str, store: &dyn BackupStore) {
         self.out.send(Event::JpgFailed {
             id: id.to_string(),
-            failed: MadeList::load_readonly(root).failed().to_vec(),
+            failed: MadeList::load_readonly_in(store).failed().to_vec(),
         });
     }
 
@@ -1811,10 +2359,40 @@ impl Worker {
             if let Some(why) = &d.offline {
                 return Err(why.clone());
             }
-            let root = d
-                .backup_dir
-                .clone()
-                .ok_or("This device has no backup folder yet.")?;
+            let root = match d.destination() {
+                Some(Destination::Local(p)) => p,
+                Some(dest @ Destination::S3(_)) => {
+                    let store = self
+                        .store_for(&dest)
+                        .map_err(|e| s3::open_failure(&e).text())?;
+                    let (view, settings) = (d.view, d.settings.clone());
+                    let out = &self.out;
+                    let cancel = &self.flags.sync.cancel;
+                    let on_event = &mut |ev| out.send(Event::Jpg(ev));
+                    let r = match retry {
+                        None => jpgs::backfill_in(
+                            &*store,
+                            id,
+                            view,
+                            &settings.archive_name,
+                            &settings.ignore_names,
+                            cancel,
+                            on_event,
+                        ),
+                        Some(heics) => jpgs::retry_failures_in(
+                            &*store,
+                            id,
+                            view,
+                            heics.as_deref(),
+                            cancel,
+                            on_event,
+                        ),
+                    };
+                    self.send_jpg_failures(id, &*store);
+                    return r.map_err(|e| e.to_string());
+                }
+                None => return Err("This device has no backup folder yet.".into()),
+            };
             let (view, settings) = (d.view, d.settings.clone());
             let out = &self.out;
             let cancel = &self.flags.sync.cancel;
@@ -1833,7 +2411,7 @@ impl Worker {
                     jpgs::retry_failures(&root, id, view, heics.as_deref(), cancel, on_event)
                 }
             };
-            self.send_jpg_failures(id, &root);
+            self.send_jpg_failures(id, &LocalStore::new(&root));
             r.map_err(|e| e.to_string())
         })();
         match &result {
@@ -1890,7 +2468,9 @@ impl Worker {
         let Some(d) = self.registry.get_mut(&plan.device_key) else {
             return;
         };
-        d.backup_dir = Some(plan.root.clone());
+        if d.s3.is_none() {
+            d.backup_dir = Some(plan.root.clone());
+        }
         // A sync that was stopped or failed early and copied, changed and archived nothing
         // doesn't replace what the page says of the last one that did something.
         let did_something = copy.copied > 0 || copy.replaced > 0 || archived > 0;
@@ -1937,6 +2517,9 @@ impl Worker {
             plan.root.clone(),
             plan.archive_name.clone(),
         );
+        let Ok(store) = self.dest_for(plan).and_then(|d| self.store_for(&d)) else {
+            return;
+        };
         // The fake device's folder is on this PC's disk, which is not its size.
         let on_this_pc =
             cfg!(all(debug_assertions, feature = "fake-device")) && self.fake.is_some();
@@ -1956,15 +2539,19 @@ impl Worker {
         let spawned = std::thread::Builder::new()
             .name("sizes".into())
             .spawn(move || {
-                let names = match owner::read(&root) {
+                let names = match owner::read_in(&*store) {
                     OwnerState::Owned(o) => o.archive_names,
                     _ => vec![name],
                 };
                 let started = Instant::now();
-                let folder = space::folder_sizes(&root, &names);
-                // The folder may not exist yet (before the first sync): ask the disk it will be on.
+                let folder = space::folder_sizes_in(&*store, &names);
+                // The folder may not exist yet (before the first sync): ask the disk it will be
+                // on. A bucket has no disk to ask.
                 let mut at = root.as_path();
                 let backup_disk = loop {
+                    if store.as_local().is_none() {
+                        break None;
+                    }
                     if at.exists() {
                         break platform::disk_space(at);
                     }
@@ -2005,15 +2592,32 @@ impl Worker {
         if let Some(why) = self.offline_reason(&plan.device_key) {
             return Err(why);
         }
-        owner::hand_over(
-            &plan.root,
-            &plan.device_key,
-            &plan.device_label,
-            plan.signals.clone(),
-            plan.view,
-            &plan.archive_name,
-            &pnk_core::utc_stamp(),
-        )
+        let dest = self.dest_for(&plan)?;
+        match &dest {
+            Destination::Local(root) => owner::hand_over(
+                root,
+                &plan.device_key,
+                &plan.device_label,
+                plan.signals.clone(),
+                plan.view,
+                &plan.archive_name,
+                &pnk_core::utc_stamp(),
+            ),
+            Destination::S3(_) => {
+                let store = self
+                    .store_for(&dest)
+                    .map_err(|e| s3::open_failure(&e).text())?;
+                owner::hand_over_in(
+                    &*store,
+                    &plan.device_key,
+                    &plan.device_label,
+                    plan.signals.clone(),
+                    plan.view,
+                    &plan.archive_name,
+                    &pnk_core::utc_stamp(),
+                )
+            }
+        }
     }
 
     fn current_plan(&self, plan_id: u64) -> Result<Arc<ScanPlan>, String> {
@@ -2026,15 +2630,19 @@ impl Worker {
     fn edit_skip_list(
         &mut self,
         plan_id: u64,
-        edit: impl FnOnce(&StateDir, &Scope, &ScanPlan) -> Result<(), String>,
+        edit: impl FnOnce(&StateDir, &Scope, &dyn BackupStore, &ScanPlan) -> Result<(), String>,
     ) {
         let result = (|| -> Result<Vec<String>, String> {
             let plan = self.current_plan(plan_id)?;
-            let scope = Scope::new(&plan.device_key, &plan.root);
-            edit(&self.state, &scope, &plan)?;
+            let dest = self.dest_for(&plan)?;
+            let store = self
+                .store_for(&dest)
+                .map_err(|e| s3::open_failure(&e).text())?;
+            let scope = Scope::in_store(&plan.device_key, &*store, &plan.root);
+            edit(&self.state, &scope, &*store, &plan)?;
             let mut list: Vec<String> = self
                 .state
-                .skip_list(&scope)
+                .skip_list_in(&scope, &*store)
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .collect();
@@ -2069,7 +2677,7 @@ fn describe(cmd: &Command) -> String {
         Command::Open(d) => format!("open {}", d.id),
         Command::Close => "close the device".into(),
         Command::Eject(d) => format!("eject {}", d.id),
-        Command::Scan(root) => format!("scan against {}", root.display()),
+        Command::Scan(dest) => format!("scan against {}", dest.label().display()),
         Command::Sync {
             plan_id,
             items,
@@ -2110,21 +2718,30 @@ fn describe(cmd: &Command) -> String {
         Command::Forget { id } => format!("forget {id}"),
         Command::LoadHistory { id } => format!("load the sync history of {id}"),
         Command::SetSettings { id, .. } => format!("save the settings of {id}"),
-        Command::SetBackupDir { id, dir } => {
-            format!("backup folder of {id}: {}", dir.display())
+        Command::SetDestination { id, dest } => {
+            format!("backup place of {id}: {}", dest.label().display())
         }
-        Command::Relocate { id, dir } => {
-            format!("the backup of {id} moved to {}", dir.display())
+        Command::Relocate { id, dest } => {
+            format!("the backup of {id} moved to {}", dest.label().display())
         }
+        Command::TestS3 { config } => format!("test the bucket {}", s3::address(config)),
+        Command::CheckStores => "look at each bucket".into(),
+        Command::SetMode(m) => format!("switch to {} mode", m.label()),
+        Command::RebuildMtimeCache { id } => format!("rebuild the modified-time cache of {id}"),
         Command::RenameArchive { plan_id, new_name } => {
             format!("rename the archive folder to \"{new_name}\" (scan {plan_id})")
         }
         Command::FindBackups { root, apply } => format!(
             "find my backups in {}{}",
-            root.display(),
+            root.label().display(),
             if *apply { ", add them" } else { "" }
         ),
-        Command::AddExisting { dir } => format!("add the existing backup in {}", dir.display()),
+        Command::AddExisting { dir } => {
+            format!("add the existing backup in {}", dir.label().display())
+        }
+        Command::RefreshBucket => "look in the bucket again".into(),
+        Command::SaveBucketSettings { .. } => "save the settings in the bucket".into(),
+        Command::BucketPoll => "take in what the bucket said".into(),
     }
 }
 
@@ -2171,6 +2788,36 @@ fn sync_record(plan: &ScanPlan, o: &SyncOutcome, began: &(Instant, String, Strin
         disk_full: c.disk_full,
         note,
     }
+}
+
+/// A bucket has no Recycle Bin: a device that would send files there archives them instead.
+fn fit_for_bucket(mode: pnk_core::registry::DeletedFiles) -> pnk_core::registry::DeletedFiles {
+    match mode {
+        pnk_core::registry::DeletedFiles::RecycleBin => pnk_core::registry::DeletedFiles::Archive,
+        other => other,
+    }
+}
+
+fn no_bin_in_a_bucket(d: &mut KnownDevice) {
+    if d.s3.is_some() {
+        d.settings.deleted_files = fit_for_bucket(d.settings.deleted_files);
+    }
+}
+
+/// The history file of a backup, as a name in its store.
+fn history_rel() -> pnk_core::paths::SafeRelPath {
+    pnk_core::paths::SafeRelPath::parse(pnk_core::folder_record::HISTORY_FILE)
+        .expect("the history name is a safe name")
+}
+
+/// Adds a sync to the history kept in the backup's own store (a bucket).
+fn append_history_in(store: &dyn BackupStore, record: &SyncRecord) -> std::io::Result<()> {
+    pnk_core::history::append_in(store, &history_rel(), record)
+}
+
+/// The history kept in the backup's own store, newest first.
+fn load_history_in(store: &dyn BackupStore) -> Vec<SyncRecord> {
+    pnk_core::history::load_in(store, &history_rel())
 }
 
 /// Fake-device reads slowed to about 3 MB/s, so Skip current and Stop can be tried by hand.
@@ -2228,7 +2875,44 @@ fn sentence(note: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sentence;
+    use super::*;
+
+    /// The history of a backup in a bucket is read and written through its store, in the
+    /// history file at the top of it, newest first. (A folder stands in for the bucket.)
+    #[test]
+    fn history_in_a_store_is_appended_and_read_back() {
+        let t = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(t.path());
+        assert!(load_history_in(&store).is_empty());
+        for n in 1..=3 {
+            let r = SyncRecord {
+                copied: n,
+                ..SyncRecord::default()
+            };
+            append_history_in(&store, &r).unwrap();
+        }
+        let got = load_history_in(&store);
+        assert_eq!(got.iter().map(|r| r.copied).collect::<Vec<_>>(), [3, 2, 1]);
+        assert!(
+            t.path()
+                .join(pnk_core::folder_record::HISTORY_FILE)
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn a_bucket_has_no_recycle_bin() {
+        use pnk_core::registry::DeletedFiles;
+        assert_eq!(
+            fit_for_bucket(DeletedFiles::RecycleBin),
+            DeletedFiles::Archive
+        );
+        assert_eq!(
+            fit_for_bucket(DeletedFiles::LeaveInPlace),
+            DeletedFiles::LeaveInPlace
+        );
+        assert_eq!(fit_for_bucket(DeletedFiles::Archive), DeletedFiles::Archive);
+    }
 
     #[test]
     fn notes_become_sentences() {
@@ -2251,6 +2935,26 @@ mod fake_device_tests {
     use std::sync::atomic::Ordering;
 
     const DEV: &str = FAKE_PNP_ID;
+
+    /// A worker in Local mode on the settings folder `state`.
+    fn spawn(
+        ctx: egui::Context,
+        state: StateDir,
+        fake: Option<Fake>,
+        flags: Flags,
+    ) -> (Sender<Command>, Receiver<Event>) {
+        super::spawn(ctx, state, Mode::Local, fake, flags)
+    }
+
+    fn spawn_with(
+        ctx: egui::Context,
+        state: StateDir,
+        fake: Option<Fake>,
+        flags: Flags,
+        eject: EjectFn,
+    ) -> (Sender<Command>, Receiver<Event>) {
+        super::spawn_with(ctx, state, Mode::Local, fake, flags, eject)
+    }
 
     fn next<T>(rx: &Receiver<Event>, what: &str, mut pick: impl FnMut(Event) -> Option<T>) -> T {
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -2294,7 +2998,7 @@ mod fake_device_tests {
         tx.send(Command::CreateDevice(Box::new(NewDevice {
             device: DEV.into(),
             name: "Fake phone".into(),
-            backup_dir: backup.to_path_buf(),
+            destination: Destination::Local(backup.to_path_buf()),
             settings: DeviceSettings::defaults_for(DeviceKind::Ptp),
             use_id_file_id: false,
         })))
@@ -2410,7 +3114,7 @@ mod fake_device_tests {
         let (_, result) = answer(&rx);
         assert_eq!(result, Ok(()));
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
-        tx.send(Command::Scan(backup)).unwrap();
+        tx.send(Command::Scan(Destination::Local(backup))).unwrap();
         let failed = next(&rx, "ScanFailed", |e| match e {
             Event::ScanFailed { message: m, .. } => Some(m),
             _ => None,
@@ -2437,7 +3141,15 @@ mod fake_device_tests {
     }
 
     fn scan(tx: &Sender<Command>, rx: &Receiver<Event>, root: &Path) -> (u64, Arc<ScanPlan>) {
-        tx.send(Command::Scan(root.to_path_buf())).unwrap();
+        scan_dest(tx, rx, Destination::Local(root.to_path_buf()))
+    }
+
+    fn scan_dest(
+        tx: &Sender<Command>,
+        rx: &Receiver<Event>,
+        dest: Destination,
+    ) -> (u64, Arc<ScanPlan>) {
+        tx.send(Command::Scan(dest)).unwrap();
         next(rx, "ScanDone", |e| match e {
             Event::ScanDone(d) => Some((d.plan_id, d.plan)),
             Event::ScanFailed { message: m, .. } => panic!("scan failed: {m}"),
@@ -2552,7 +3264,7 @@ mod fake_device_tests {
         tx.send(Command::CreateDevice(Box::new(NewDevice {
             device: DEV.into(),
             name: "Fake phone".into(),
-            backup_dir: backup.clone(),
+            destination: Destination::Local(backup.clone()),
             settings: DeviceSettings {
                 jpeg_copies: true,
                 ..DeviceSettings::defaults_for(DeviceKind::Ptp)
@@ -2665,14 +3377,15 @@ mod fake_device_tests {
                 .is_empty()
         );
         // A scan is refused until the device is set up.
-        tx.send(Command::Scan(t.path().join("backup"))).unwrap();
+        tx.send(Command::Scan(Destination::Local(t.path().join("backup"))))
+            .unwrap();
         next(&rx, "ScanFailed", |e| {
             matches!(e, Event::ScanFailed { .. }).then_some(())
         });
         tx.send(Command::CreateDevice(Box::new(NewDevice {
             device: DEV.into(),
             name: "Fake phone".into(),
-            backup_dir: t.path().join("backup"),
+            destination: Destination::Local(t.path().join("backup")),
             settings: DeviceSettings::defaults_for(DeviceKind::Ptp),
             use_id_file_id: false,
         })))
@@ -2694,7 +3407,8 @@ mod fake_device_tests {
             before,
             "nothing learned before the answer"
         );
-        tx.send(Command::Scan(t.path().join("backup"))).unwrap();
+        tx.send(Command::Scan(Destination::Local(t.path().join("backup"))))
+            .unwrap();
         next(&rx, "ScanFailed", |e| {
             matches!(e, Event::ScanFailed { .. }).then_some(())
         });
@@ -2967,7 +3681,7 @@ mod fake_device_tests {
         tx.send(Command::CreateDevice(Box::new(NewDevice {
             device: DEV.into(),
             name: "Fake phone".into(),
-            backup_dir: backup.clone(),
+            destination: Destination::Local(backup.clone()),
             settings: DeviceSettings {
                 scan_automatically: true,
                 archive_name: "_Old stuff".into(),
@@ -3026,13 +3740,13 @@ mod fake_device_tests {
         assert!(devices.is_empty());
         // A folder that isn't a backup says so.
         tx.send(Command::AddExisting {
-            dir: t.path().join("phone"),
+            dir: Destination::Local(t.path().join("phone")),
         })
         .unwrap();
         assert!(notice(&rx).unwrap_err().contains("No backup found"));
         // The folder that holds backups works, and so would the backup folder itself.
         tx.send(Command::AddExisting {
-            dir: backup.parent().unwrap().to_path_buf(),
+            dir: Destination::Local(backup.parent().unwrap().to_path_buf()),
         })
         .unwrap();
         let said = notice(&rx).unwrap();
@@ -3046,7 +3760,7 @@ mod fake_device_tests {
         assert_eq!(folders, [(id.clone(), FolderState::Present)]);
         // Adding it again changes nothing.
         tx.send(Command::AddExisting {
-            dir: backup.clone(),
+            dir: Destination::Local(backup.clone()),
         })
         .unwrap();
         assert!(notice(&rx).unwrap().contains("Already known"));
@@ -3097,7 +3811,8 @@ mod fake_device_tests {
         .unwrap();
         let (bound, _) = ready(&rx);
         assert_eq!(bound, id);
-        tx.send(Command::Scan(backup.clone())).unwrap();
+        tx.send(Command::Scan(Destination::Local(backup.clone())))
+            .unwrap();
         let failed = next(&rx, "ScanFailed", |e| match e {
             Event::ScanFailed { message: m, .. } => Some(m),
             _ => None,
@@ -3119,7 +3834,7 @@ mod fake_device_tests {
         // Found: the record comes from the folder.
         tx.send(Command::Relocate {
             id: id.clone(),
-            dir: away.clone(),
+            dest: Destination::Local(away.clone()),
         })
         .unwrap();
         assert!(notice(&rx).is_ok());
@@ -3127,6 +3842,218 @@ mod fake_device_tests {
         assert!(devices[0].offline.is_none());
         assert_eq!(devices[0].settings.archive_name, "_Old stuff");
         assert_eq!(folders, [(id, FolderState::Present)]);
+        drop(tx);
+    }
+
+    /// The settings for a test bucket, or `None` (the test is skipped) unless `PNK_S3_TEST=1`.
+    /// The same variables as core's S3 tests; the prefix is under `itest/` in `pnk-test`.
+    fn s3_test_config(prefix: &str) -> Option<S3Config> {
+        if std::env::var("PNK_S3_TEST").ok().as_deref() != Some("1") {
+            eprintln!("skipped: PNK_S3_TEST is not 1");
+            return None;
+        }
+        let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        Some(S3Config {
+            provider: Default::default(),
+            account_id: None,
+            endpoint: std::env::var("PNK_S3_ENDPOINT").expect("PNK_S3_ENDPOINT"),
+            region: "us-east-1".into(),
+            bucket: var("PNK_S3_BUCKET", "pnk-test"),
+            prefix: prefix.into(),
+            profile: Some(var("PNK_S3_PROFILE", "pnk-test")),
+            credentials_file: None,
+            path_style: true,
+            ca_file: None,
+        })
+    }
+
+    /// Deletes what a test left under its `itest/` prefix when it ends (even if it fails).
+    struct Purge(S3Config);
+
+    impl Drop for Purge {
+        fn drop(&mut self) {
+            if let Ok(store) = pnk_core::store::S3Store::new(self.0.clone()) {
+                store.purge_test_prefix();
+            }
+        }
+    }
+
+    /// The fake phone backs up to a bucket end to end, as in the window: Test, set up, Scan,
+    /// Start sync, and a second scan that finds everything backed up. Needs a test server.
+    #[test]
+    fn a_fake_phone_backs_up_to_a_bucket_end_to_end() {
+        let prefix = format!("itest/app-p6/{}/", new_device_id());
+        let Some(cfg) = s3_test_config(&prefix) else {
+            return;
+        };
+        let _purge = Purge(cfg.clone());
+        let dest = Destination::S3(cfg.clone());
+        let t = tempfile::tempdir().unwrap();
+        let phone = t.path().join("phone");
+        fs::create_dir_all(phone.join("DCIM/100")).unwrap();
+        fs::write(phone.join("DCIM/100/IMG_0001.JPG"), [1u8; 3000]).unwrap();
+        fs::write(phone.join("DCIM/100/IMG_0002.JPG"), [2u8; 70_000]).unwrap();
+        let (tx, rx) = worker_on(&t.path().join("state"), &phone);
+        let _ = registry_event(&rx);
+        // Test: opens the bucket and runs the server's self-test.
+        tx.send(Command::TestS3 {
+            config: cfg.clone(),
+        })
+        .unwrap();
+        let tested = next(&rx, "S3Tested", |e| match e {
+            Event::S3Tested(o) => Some(o),
+            _ => None,
+        });
+        assert!(tested.is_ok(), "{}", tested.text());
+        // A bucket that isn't there says so.
+        let mut wrong = cfg.clone();
+        wrong.bucket = "pnk-no-such-bucket".into();
+        tx.send(Command::TestS3 { config: wrong }).unwrap();
+        let tested = next(&rx, "S3Tested", |e| match e {
+            Event::S3Tested(o) => Some(o),
+            _ => None,
+        });
+        assert!(!tested.is_ok(), "{}", tested.text());
+        // Set up, scan, sync.
+        let o = opened(&tx, &rx);
+        assert!(matches!(o.stage, Stage::Setup(_)));
+        tx.send(Command::CreateDevice(Box::new(NewDevice {
+            device: DEV.into(),
+            name: "Fake phone".into(),
+            destination: dest.clone(),
+            settings: DeviceSettings::defaults_for(DeviceKind::Ptp),
+            use_id_file_id: false,
+        })))
+        .unwrap();
+        let (id, _) = ready(&rx);
+        let state = next(&rx, "S3State", |e| match e {
+            Event::S3State { id: i, state, .. } => Some((i, state)),
+            _ => None,
+        });
+        assert_eq!(state, (id.clone(), FolderState::Present));
+        let (plan_id, plan) = scan_dest(&tx, &rx, dest.clone());
+        assert_eq!(plan.entries.len(), 2);
+        tx.send(Command::Sync {
+            plan_id,
+            items: new_items(&plan),
+            archive: false,
+            confirmed: false,
+        })
+        .unwrap();
+        let outcome = next(&rx, "SyncDone", |e| match e {
+            Event::SyncDone { result: r, .. } => Some(r.expect("the sync ran")),
+            _ => None,
+        });
+        assert_eq!((outcome.copy.copied, outcome.copy.failed), (2, 0));
+        // The files, the marker, the record and the history are in the bucket.
+        let store = dest.open().unwrap();
+        let rel = |p: &str| pnk_core::paths::SafeRelPath::parse(p).unwrap();
+        for e in &plan.entries {
+            let (bytes, _) = store
+                .read(&rel(e.target.as_str()))
+                .unwrap()
+                .expect("copied");
+            assert_eq!(bytes.len() as u64, e.size.unwrap());
+        }
+        for f in [
+            pnk_core::owner::MARKER,
+            pnk_core::folder_record::DEVICE_FILE,
+            pnk_core::folder_record::HISTORY_FILE,
+        ] {
+            assert!(store.stat(&rel(f)).unwrap().is_some(), "{f} in the bucket");
+        }
+        tx.send(Command::LoadHistory { id: id.clone() }).unwrap();
+        let records = next(&rx, "History", |e| match e {
+            Event::History { records, .. } => Some(records),
+            _ => None,
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].copied, 2);
+        // A second scan finds it all backed up.
+        let (_, again) = scan_dest(&tx, &rx, dest.clone());
+        assert!(again.entries.iter().all(|e| e.status == Status::Verified));
+        drop(tx);
+    }
+
+    /// Against the test server: "Find my backups" in a bucket finds a device one level below the
+    /// base prefix, "Rebuild cache" makes the next scan look files up again, and a place that
+    /// overlaps another device's is refused.
+    #[test]
+    fn a_bucket_is_searched_one_level_down_and_the_cache_is_rebuilt() {
+        let base = format!("itest/app-p56/{}/", new_device_id());
+        let Some(base_cfg) = s3_test_config(&base) else {
+            return;
+        };
+        let mut cfg = base_cfg.clone();
+        cfg.prefix = format!("{base}phone-a/");
+        // The test prefix is the base, which covers the device's folder below it.
+        let _purge = Purge(base_cfg.clone());
+        let dest = Destination::S3(cfg.clone());
+        let t = tempfile::tempdir().unwrap();
+        let phone = t.path().join("phone");
+        fs::create_dir_all(phone.join("DCIM")).unwrap();
+        fs::write(phone.join("DCIM/IMG_0001.JPG"), [1u8; 3000]).unwrap();
+        let (tx, rx) = worker_on(&t.path().join("state"), &phone);
+        let _ = registry_event(&rx);
+        let _ = opened(&tx, &rx);
+        tx.send(Command::CreateDevice(Box::new(NewDevice {
+            device: DEV.into(),
+            name: "Fake phone".into(),
+            destination: dest.clone(),
+            // Lookups only happen when files are compared by date.
+            settings: DeviceSettings {
+                compare_by_date: true,
+                ..DeviceSettings::defaults_for(DeviceKind::Ptp)
+            },
+            use_id_file_id: false,
+        })))
+        .unwrap();
+        let (id, _) = ready(&rx);
+        let (plan_id, plan) = scan_dest(&tx, &rx, dest.clone());
+        tx.send(Command::Sync {
+            plan_id,
+            items: new_items(&plan),
+            archive: false,
+            confirmed: false,
+        })
+        .unwrap();
+        next(&rx, "SyncDone", |e| match e {
+            Event::SyncDone { result: r, .. } => Some(r.expect("the sync ran")),
+            _ => None,
+        });
+        // The next scan uses the cache; after "Rebuild cache" it looks the files up again.
+        let (_, cached) = scan_dest(&tx, &rx, dest.clone());
+        assert_eq!(cached.mtime_lookups, 0);
+        tx.send(Command::RebuildMtimeCache { id: id.clone() })
+            .unwrap();
+        let notice = next(&rx, "Notice", |e| match e {
+            Event::Notice(r) => Some(r),
+            _ => None,
+        });
+        assert!(notice.is_ok(), "{notice:?}");
+        let (_, again) = scan_dest(&tx, &rx, dest.clone());
+        assert!(again.mtime_lookups > 0, "the cache was forgotten");
+        // A place inside the device's own is refused for another device: the window checks this
+        // with the same function.
+        let mut inside = cfg.clone();
+        inside.prefix = format!("{}DCIM/", cfg.prefix);
+        assert!(pnk_core::store::dest::overlaps(
+            &dest,
+            &Destination::S3(inside)
+        ));
+        // Forget the device, then look in the base prefix without adding anything.
+        tx.send(Command::Forget { id }).unwrap();
+        let _ = registry_event(&rx);
+        tx.send(Command::FindBackups {
+            root: Destination::S3(base_cfg),
+            apply: false,
+        })
+        .unwrap();
+        let found = next(&rx, "Found", |e| match e {
+            Event::Found(f) => Some(f),
+            _ => None,
+        });
+        assert_eq!(found.added, ["Fake phone"], "{:?}", found.problems);
         drop(tx);
     }
 
@@ -3141,9 +4068,9 @@ mod fake_device_tests {
         let _ = registry_event(&rx);
         let new = t.path().join("new-place");
         fs::create_dir_all(&new).unwrap();
-        tx.send(Command::SetBackupDir {
+        tx.send(Command::SetDestination {
             id,
-            dir: new.clone(),
+            dest: Destination::Local(new.clone()),
         })
         .unwrap();
         let _ = registry_event(&rx);
@@ -3155,5 +4082,617 @@ mod fake_device_tests {
             assert!(backup.join(f).is_file(), "{f} left in the old folder");
         }
         drop(tx);
+    }
+
+    fn bucket_device(name: &str) -> KnownDevice {
+        let mut d = KnownDevice::new(
+            DeviceKind::Ptp,
+            name,
+            &Signals::default(),
+            "2026-01-01T00:00:00Z",
+        );
+        d.set_destination(Destination::S3(S3Config {
+            provider: Default::default(),
+            account_id: None,
+            endpoint: "http://127.0.0.1:9".into(),
+            region: "us-east-1".into(),
+            bucket: "b".into(),
+            prefix: format!("{name}/"),
+            profile: Some("none-such".into()),
+            credentials_file: Some(PathBuf::from("no-such-credentials-file")),
+            path_style: true,
+            ca_file: None,
+        }));
+        d
+    }
+
+    /// The two modes have their own lists: Local's is the settings folder, S3's the `s3` folder
+    /// inside it. Switching swaps them and never mixes them, and each keeps its own files.
+    #[test]
+    fn the_two_modes_keep_separate_device_lists() {
+        let t = tempfile::tempdir().unwrap();
+        let (_backup, local_id, state_path) = synced_phone(t.path());
+        let s3_dir = modes::s3_dir(&state_path);
+        let s3_state = StateDir::open(&s3_dir).unwrap();
+        let bucket = bucket_device("Pixel");
+        let mut reg = Registry::default();
+        reg.add(bucket.clone());
+        reg.save(&s3_state).unwrap();
+
+        let (tx, rx) = worker_on(&state_path, &t.path().join("phone"));
+        let (devices, _) = registry_event(&rx);
+        assert_eq!(
+            devices.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            [local_id.as_str()]
+        );
+        tx.send(Command::SetMode(Mode::S3)).unwrap();
+        let (devices, _) = registry_event(&rx);
+        assert_eq!(
+            devices.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            [bucket.id.as_str()]
+        );
+        // Something done in S3 mode lands in the S3 folder only.
+        tx.send(Command::Rename {
+            id: bucket.id.clone(),
+            name: "Pixel 8".into(),
+        })
+        .unwrap();
+        let (devices, _) = registry_event(&rx);
+        assert_eq!(devices[0].name, "Pixel 8");
+        tx.send(Command::SetMode(Mode::Local)).unwrap();
+        let (devices, _) = registry_event(&rx);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, local_id);
+        drop(tx);
+        let local_file = fs::read_to_string(state_path.join("devices.json")).unwrap();
+        let s3_file = fs::read_to_string(s3_dir.join("devices.json")).unwrap();
+        assert!(local_file.contains(&local_id) && !local_file.contains(&bucket.id));
+        assert!(s3_file.contains(&bucket.id) && s3_file.contains("Pixel 8"));
+        assert!(!s3_file.contains(&local_id));
+    }
+
+    /// Local mode writes no S3 fields anywhere, and no mode file until S3 is chosen.
+    #[test]
+    fn local_mode_files_have_no_s3_in_them() {
+        let t = tempfile::tempdir().unwrap();
+        let (_backup, _id, state_path) = synced_phone(t.path());
+        let devices = fs::read_to_string(state_path.join("devices.json")).unwrap();
+        assert!(!devices.contains("\"s3\"") && !devices.contains("provider"));
+        if let Ok(config) = fs::read_to_string(state_path.join("config.json")) {
+            assert!(!config.contains("default_s3") && !config.contains("provider"));
+        }
+        assert!(!state_path.join("mode.json").exists());
+        // Only the one extra folder of S3 mode's own.
+        let mut names: Vec<String> = fs::read_dir(&state_path)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert!(names.contains(&"s3".to_string()), "{names:?}");
+        assert!(
+            fs::read_dir(state_path.join("s3"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    /// Both modes' interrupted-copy records are dealt with at start, whichever mode it opens in.
+    #[test]
+    fn both_modes_are_tidied_up_at_start() {
+        for start in [Mode::Local, Mode::S3] {
+            let t = tempfile::tempdir().unwrap();
+            let state_path = t.path().join("state");
+            let s3_dir = modes::s3_dir(&state_path);
+            let record = r#"{"device":"x","root":"C:/nowhere","source":"DCIM/a.jpg","temp":"DCIM/a.jpg.pnk-part"}"#;
+            for d in [&state_path, &s3_dir] {
+                fs::create_dir_all(d).unwrap();
+                fs::write(d.join("in_progress.json"), record).unwrap();
+            }
+            let phone = t.path().join("phone");
+            fs::create_dir_all(&phone).unwrap();
+            let fake = Fake {
+                folder: phone,
+                slow: false,
+                lag: false,
+                named: false,
+            };
+            let (tx, rx) = super::spawn(
+                egui::Context::default(),
+                StateDir::open(&state_path).unwrap(),
+                start,
+                Some(fake),
+                Flags::default(),
+            );
+            let notes: Vec<String> = (0..2)
+                .map(|_| {
+                    next(&rx, "Recovered", |e| match e {
+                        Event::Recovered(n) => Some(n),
+                        _ => None,
+                    })
+                })
+                .collect();
+            let other = match start {
+                Mode::Local => "S3 mode: ",
+                Mode::S3 => "Local mode: ",
+            };
+            assert_eq!(
+                notes.iter().filter(|n| n.starts_with(other)).count(),
+                1,
+                "{notes:?}"
+            );
+            assert!(!state_path.join("in_progress.json").exists());
+            assert!(!s3_dir.join("in_progress.json").exists());
+            drop(tx);
+        }
+    }
+
+    /// A crash record about a bucket that can't be reached is kept in its own mode's folder, to
+    /// be tried again, while the other mode's is cleared.
+    #[test]
+    fn an_s3_record_waits_for_its_bucket_in_the_s3_folder() {
+        let t = tempfile::tempdir().unwrap();
+        let state_path = t.path().join("state");
+        let s3_dir = modes::s3_dir(&state_path);
+        let s3_state = StateDir::open(&s3_dir).unwrap();
+        let d = bucket_device("Pixel");
+        let Some(Destination::S3(cfg)) = d.destination() else {
+            panic!("a bucket device");
+        };
+        let mut reg = Registry::default();
+        reg.add(d.clone());
+        reg.save(&s3_state).unwrap();
+        let rec = pnk_core::state::InProgress {
+            device: d.id.clone(),
+            root: Destination::S3(cfg.clone()).label(),
+            source: "DCIM/a.jpg".into(),
+            temp: PathBuf::from("DCIM/a.jpg"),
+            replace: None,
+            destination: Some(Destination::S3(cfg)),
+        };
+        s3_state.begin_copy(&rec).unwrap();
+        let phone = t.path().join("phone");
+        fs::create_dir_all(&phone).unwrap();
+        let (tx, rx) = worker_on(&state_path, &phone);
+        let note = next(&rx, "Recovered", |e| match e {
+            Event::Recovered(n) => Some(n),
+            _ => None,
+        });
+        assert!(note.starts_with("S3 mode: "), "{note}");
+        assert!(
+            s3_dir.join("in_progress.json").exists(),
+            "kept for the next start"
+        );
+        drop(tx);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // S3 mode: the bucket is the source of truth for everything but the connection.
+
+    /// A worker in S3 mode on the settings folder `state_path`, whose only S3 setting is the
+    /// connection `conn` (its folder is the base folder). The fake device serves `phone`.
+    fn s3_worker(
+        state_path: &Path,
+        phone: &Path,
+        conn: &S3Config,
+    ) -> (Sender<Command>, Receiver<Event>) {
+        let base = StateDir::open(state_path).unwrap();
+        let s3 = StateDir::open(modes::s3_dir(state_path)).unwrap();
+        let mut config = s3.config();
+        config.default_s3 = Some(conn.clone());
+        s3.save_config(&config).unwrap();
+        let fake = Fake {
+            folder: phone.to_path_buf(),
+            slow: false,
+            lag: false,
+            named: false,
+        };
+        super::spawn(
+            egui::Context::default(),
+            base,
+            Mode::S3,
+            Some(fake),
+            Flags::default(),
+        )
+    }
+
+    /// Waits until the look in the bucket has an answer (the list is the bucket's, or the bucket
+    /// can't be used), and returns that and the devices as last published.
+    fn bucket_settled(rx: &Receiver<Event>) -> (BucketInfo, Vec<KnownDevice>) {
+        let mut devices = Vec::new();
+        let info = next(rx, "the bucket's answer", |e| match e {
+            Event::Registry { devices: d, .. } => {
+                devices = d;
+                None
+            }
+            Event::Bucket(i)
+                if matches!(
+                    i.status,
+                    BucketStatus::Ready | BucketStatus::Unavailable { .. }
+                ) =>
+            {
+                Some(*i)
+            }
+            _ => None,
+        });
+        (info, devices)
+    }
+
+    /// Asks for another look in the bucket and waits for its answer (not for one that was
+    /// already on its way).
+    fn refreshed(tx: &Sender<Command>, rx: &Receiver<Event>) -> (BucketInfo, Vec<KnownDevice>) {
+        tx.send(Command::RefreshBucket).unwrap();
+        let mut devices = Vec::new();
+        let mut looking = false;
+        let info = next(rx, "the bucket's answer", |e| match e {
+            Event::Registry { devices: d, .. } => {
+                devices = d;
+                None
+            }
+            Event::Bucket(i) if i.status == BucketStatus::Looking => {
+                looking = true;
+                None
+            }
+            Event::Bucket(i)
+                if looking
+                    && matches!(
+                        i.status,
+                        BucketStatus::Ready | BucketStatus::Unavailable { .. }
+                    ) =>
+            {
+                Some(*i)
+            }
+            _ => None,
+        });
+        (info, devices)
+    }
+
+    /// A connection to a server that isn't there, with the cached device list `devices` in the
+    /// S3 settings folder.
+    fn offline_pc(t: &Path, devices: &[KnownDevice]) -> (PathBuf, S3Config) {
+        let state_path = t.join("state");
+        let s3 = StateDir::open(modes::s3_dir(&state_path)).unwrap();
+        let mut reg = Registry::default();
+        for d in devices {
+            reg.add(d.clone());
+        }
+        reg.save(&s3).unwrap();
+        let conn = S3Config {
+            provider: Default::default(),
+            account_id: None,
+            endpoint: "http://127.0.0.1:9".into(),
+            region: "us-east-1".into(),
+            bucket: "b".into(),
+            prefix: "devices/".into(),
+            profile: Some("none-such".into()),
+            credentials_file: Some(PathBuf::from("no-such-credentials-file")),
+            path_style: true,
+            ca_file: None,
+        };
+        (state_path, conn)
+    }
+
+    fn cached_device(name: &str, prefix: &str, conn: &S3Config) -> KnownDevice {
+        let mut d = KnownDevice::new(
+            DeviceKind::Ptp,
+            name,
+            &Signals::default(),
+            "2026-01-01T00:00:00Z",
+        );
+        d.set_destination(Destination::S3(S3Config {
+            prefix: prefix.into(),
+            ..conn.clone()
+        }));
+        d
+    }
+
+    /// With the bucket out of reach the list is what this PC last saw, said so, and a
+    /// device's settings (the bucket's) are not changed meanwhile.
+    #[test]
+    fn with_no_bucket_the_list_is_the_cache_and_says_so() {
+        let t = tempfile::tempdir().unwrap();
+        let conn = offline_pc(t.path(), &[]).1;
+        let d = cached_device("Pixel", "devices/Pixel/", &conn);
+        let (state_path, conn) = offline_pc(t.path(), std::slice::from_ref(&d));
+        let (tx, rx) = s3_worker(&state_path, &t.path().join("phone"), &conn);
+        let (info, devices) = bucket_settled(&rx);
+        assert!(
+            matches!(info.status, BucketStatus::Unavailable { .. }),
+            "{:?}",
+            info.status
+        );
+        assert_eq!(devices.len(), 1, "the cache is shown");
+        assert_eq!(devices[0].id, d.id);
+        // The bucket's settings can't be read, so none are claimed.
+        assert!(info.settings.is_none() && info.notes.is_empty());
+        tx.send(Command::Rename {
+            id: d.id.clone(),
+            name: "Other name".into(),
+        })
+        .unwrap();
+        let said = notice(&rx).unwrap_err();
+        assert!(said.starts_with("Not renamed"), "{said}");
+        // Forgetting is kept in the bucket, so it waits too.
+        tx.send(Command::Forget { id: d.id.clone() }).unwrap();
+        assert!(notice(&rx).unwrap_err().starts_with("Not forgotten"));
+        drop(tx);
+        // Nothing was lost from the cache.
+        let s3 = StateDir::open(modes::s3_dir(&state_path)).unwrap();
+        let reg = Registry::load(&s3);
+        assert_eq!(reg.devices().len(), 1);
+        assert_eq!(reg.devices()[0].name, "Pixel");
+    }
+
+    /// A device kept from an earlier version, whose folder is not directly inside the base folder,
+    /// keeps working and is told it won't be found by other PCs. Nothing is moved.
+    #[test]
+    fn a_device_not_directly_under_the_base_folder_gets_a_note() {
+        let t = tempfile::tempdir().unwrap();
+        let conn = offline_pc(t.path(), &[]).1;
+        let legacy = cached_device("Legacy", "phones/legacy/", &conn);
+        let fine = cached_device("Fine", "devices/Fine/", &conn);
+        let (state_path, conn) = offline_pc(t.path(), &[legacy.clone(), fine.clone()]);
+        let (tx, rx) = s3_worker(&state_path, &t.path().join("phone"), &conn);
+        let (info, devices) = bucket_settled(&rx);
+        assert_eq!(devices.len(), 2);
+        let ids: Vec<&str> = info.notes.iter().map(|(i, _)| i.as_str()).collect();
+        assert_eq!(ids, [legacy.id.as_str()]);
+        assert!(
+            info.notes[0]
+                .1
+                .contains("isn't directly under the base folder")
+        );
+        drop(tx);
+    }
+
+    /// In S3 mode a device's folder must be directly inside the base folder: a new device set
+    /// up anywhere else is refused, and so is "Find it…" pointing outside it.
+    #[test]
+    fn s3_places_outside_the_base_folder_are_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let phone = t.path().join("phone");
+        fs::create_dir_all(phone.join("DCIM")).unwrap();
+        fs::write(phone.join("DCIM/A.JPG"), [1u8; 100]).unwrap();
+        let (state_path, conn) = offline_pc(t.path(), &[]);
+        let (tx, rx) = s3_worker(&state_path, &phone, &conn);
+        let _ = bucket_settled(&rx);
+        let _ = opened(&tx, &rx);
+        for prefix in ["elsewhere/phone/", "devices/", "devices/a/b/", ""] {
+            tx.send(Command::CreateDevice(Box::new(NewDevice {
+                device: DEV.into(),
+                name: "Fake phone".into(),
+                destination: Destination::S3(S3Config {
+                    prefix: prefix.into(),
+                    ..conn.clone()
+                }),
+                settings: DeviceSettings::defaults_for(DeviceKind::Ptp),
+                use_id_file_id: false,
+            })))
+            .unwrap();
+            let said = notice(&rx).unwrap_err();
+            assert!(
+                said.contains("directly inside the base folder"),
+                "{prefix}: {said}"
+            );
+        }
+        // Directly inside it is accepted.
+        let ok = pnk_core::bucket_list::place_under(&conn, "Fake phone").unwrap();
+        tx.send(Command::CreateDevice(Box::new(NewDevice {
+            device: DEV.into(),
+            name: "Fake phone".into(),
+            destination: Destination::S3(ok),
+            settings: DeviceSettings::defaults_for(DeviceKind::Ptp),
+            use_id_file_id: false,
+        })))
+        .unwrap();
+        let (id, how) = ready(&rx);
+        assert_eq!(how, How::Created);
+        tx.send(Command::SetDestination {
+            id,
+            dest: Destination::S3(S3Config {
+                prefix: "elsewhere/phone/".into(),
+                ..conn.clone()
+            }),
+        })
+        .unwrap();
+        assert!(
+            notice(&rx)
+                .unwrap_err()
+                .contains("directly inside the base folder")
+        );
+        drop(tx);
+    }
+
+    /// Against the test server: a brand-new PC that has only the connection gets every device,
+    /// its settings and history, and the settings for new devices from the bucket. A change made on
+    /// one PC reaches the other; a forgotten device is hidden everywhere and can be brought back; a
+    /// settings change made on another PC in the meantime is not overwritten.
+    #[test]
+    fn a_new_pc_with_only_the_connection_gets_everything_from_the_bucket() {
+        let top = format!("itest/app-newpc/{}/", new_device_id());
+        let Some(top_cfg) = s3_test_config(&top) else {
+            return;
+        };
+        let _purge = Purge(top_cfg.clone());
+        let base = S3Config {
+            prefix: format!("{top}devices/"),
+            ..top_cfg
+        };
+        let t = tempfile::tempdir().unwrap();
+        let phone = t.path().join("phone");
+        fs::create_dir_all(phone.join("DCIM/100")).unwrap();
+        fs::write(phone.join("DCIM/100/IMG_0001.JPG"), [1u8; 3000]).unwrap();
+
+        // PC A: connect, set the device up, sync it, set what new devices start with.
+        let (tx_a, rx_a) = s3_worker(&t.path().join("pc-a"), &phone, &base);
+        let (info, devices) = bucket_settled(&rx_a);
+        assert_eq!(info.status, BucketStatus::Ready);
+        assert!(devices.is_empty() && !info.in_bucket && info.settings.is_some());
+        assert!(matches!(opened(&tx_a, &rx_a).stage, Stage::Setup(_)));
+        let place = pnk_core::bucket_list::place_under(&base, "Fake phone").unwrap();
+        tx_a.send(Command::CreateDevice(Box::new(NewDevice {
+            device: DEV.into(),
+            name: "Fake phone".into(),
+            destination: Destination::S3(place.clone()),
+            settings: DeviceSettings {
+                scan_automatically: true,
+                archive_name: "_Old stuff".into(),
+                ..DeviceSettings::defaults_for(DeviceKind::Ptp)
+            },
+            use_id_file_id: false,
+        })))
+        .unwrap();
+        let (id, _) = ready(&rx_a);
+        let (plan_id, plan) = scan_dest(&tx_a, &rx_a, Destination::S3(place.clone()));
+        tx_a.send(Command::Sync {
+            plan_id,
+            items: new_items(&plan),
+            archive: false,
+            confirmed: false,
+        })
+        .unwrap();
+        next(&rx_a, "SyncDone", |e| match e {
+            Event::SyncDone { result: r, .. } => Some(r.expect("the sync ran")),
+            _ => None,
+        });
+        let shared = pnk_core::state::NewDeviceDefaults {
+            archive_name: "_Shared".into(),
+            scan_automatically: true,
+            ..Default::default()
+        };
+        tx_a.send(Command::SaveBucketSettings {
+            new_devices: Box::new(shared.clone()),
+            connection_changed: false,
+        })
+        .unwrap();
+        let saved = next(&rx_a, "BucketSaved", |e| match e {
+            Event::BucketSaved(o) => Some(o),
+            _ => None,
+        });
+        assert_eq!(saved, SaveOutcome::Saved);
+
+        // PC B: only the connection. Everything else comes from the bucket.
+        let pc_b = t.path().join("pc-b");
+        let (tx_b, rx_b) = s3_worker(&pc_b, &phone, &base);
+        let (info, devices) = bucket_settled(&rx_b);
+        assert_eq!(info.status, BucketStatus::Ready, "{:?}", info.problems);
+        assert!(info.in_bucket);
+        assert_eq!(info.settings.as_ref().unwrap(), &shared);
+        assert_eq!(devices.len(), 1, "{devices:?}");
+        let d = &devices[0];
+        assert_eq!(
+            (d.id.as_str(), d.name.as_str()),
+            (id.as_str(), "Fake phone")
+        );
+        assert!(d.settings.scan_automatically);
+        assert_eq!(d.settings.archive_name, "_Old stuff");
+        assert!(d.last_sync.is_some());
+        assert_eq!(
+            d.destination().map(|x| x.label()),
+            Some(Destination::S3(place.clone()).label())
+        );
+        tx_b.send(Command::LoadHistory { id: id.clone() }).unwrap();
+        let records = next(&rx_b, "History", |e| match e {
+            Event::History { records, .. } => Some(records),
+            _ => None,
+        });
+        assert_eq!(records.len(), 1, "the history is the bucket's");
+        // The device is known on this PC, not new.
+        let o = opened(&tx_b, &rx_b);
+        let Stage::Ask(Question::Maybe { candidate }) = o.stage else {
+            panic!("expected the device to be known, got {:?}", o.stage);
+        };
+        assert_eq!(candidate.id, id);
+        // This PC kept nothing of the device but the cache and the connection.
+        let b_state = StateDir::open(modes::s3_dir(&pc_b)).unwrap();
+        assert!(!History::new(&b_state).profile_file(&id).exists());
+        let kept: Vec<String> = fs::read_dir(pc_b.join("s3"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            kept.iter().all(|n| n.starts_with("config.json")
+                || n.starts_with("devices.json")
+                || n == "in_progress.json"),
+            "{kept:?}"
+        );
+
+        // A rename on A reaches B at its next look.
+        tx_a.send(Command::Rename {
+            id: id.clone(),
+            name: "Renamed on A".into(),
+        })
+        .unwrap();
+        let _ = notice_or_registry(&rx_a);
+        let (_, devices) = refreshed(&tx_b, &rx_b);
+        assert_eq!(devices[0].name, "Renamed on A");
+
+        // Settings changed on B while A still holds the old tag: A's save is not allowed to
+        // overwrite them.
+        let mut theirs = shared.clone();
+        theirs.archive_name = "_From B".into();
+        tx_b.send(Command::SaveBucketSettings {
+            new_devices: Box::new(theirs.clone()),
+            connection_changed: false,
+        })
+        .unwrap();
+        let saved = next(&rx_b, "BucketSaved", |e| match e {
+            Event::BucketSaved(o) => Some(o),
+            _ => None,
+        });
+        assert_eq!(saved, SaveOutcome::Saved);
+        let mut mine = shared.clone();
+        mine.archive_name = "_From A".into();
+        tx_a.send(Command::SaveBucketSettings {
+            new_devices: Box::new(mine),
+            connection_changed: false,
+        })
+        .unwrap();
+        let saved = next(&rx_a, "BucketSaved", |e| match e {
+            Event::BucketSaved(o) => Some(o),
+            _ => None,
+        });
+        assert_eq!(saved, SaveOutcome::Conflict);
+        let info = next(&rx_a, "Bucket", |e| match e {
+            Event::Bucket(i) => Some(*i),
+            _ => None,
+        });
+        assert_eq!(info.settings.unwrap().archive_name, "_From B");
+
+        // Forgotten on A: hidden on B too; both can bring it back.
+        tx_a.send(Command::Forget { id: id.clone() }).unwrap();
+        let (devices, _) = registry_event(&rx_a);
+        assert!(devices.is_empty());
+        let (info, devices) = refreshed(&tx_b, &rx_b);
+        assert!(devices.is_empty(), "forgotten on another PC");
+        assert_eq!(info.forgotten, std::slice::from_ref(&id));
+        let root = Destination::S3(base.clone());
+        tx_b.send(Command::FindBackups {
+            root: root.clone(),
+            apply: false,
+        })
+        .unwrap();
+        let found = next(&rx_b, "Found", |e| match e {
+            Event::Found(f) => Some(f),
+            _ => None,
+        });
+        assert_eq!(found.added, ["Renamed on A (forgotten earlier)"]);
+        tx_b.send(Command::AddExisting { dir: root }).unwrap();
+        assert!(notice(&rx_b).unwrap().contains("Added 1 backup"));
+        let (devices, _) = registry_event(&rx_b);
+        assert_eq!(devices.len(), 1);
+        let (info, devices) = refreshed(&tx_a, &rx_a);
+        assert!(info.forgotten.is_empty());
+        assert_eq!(devices.len(), 1, "back on A as well");
+        drop((tx_a, tx_b));
+    }
+
+    /// The next thing the worker says about a change: a notice, or the new list.
+    fn notice_or_registry(rx: &Receiver<Event>) -> Option<Result<String, String>> {
+        next(rx, "a Registry or Notice", |e| match e {
+            Event::Notice(r) => Some(Some(r)),
+            Event::Registry { .. } => Some(None),
+            _ => None,
+        })
     }
 }

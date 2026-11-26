@@ -16,6 +16,9 @@ name = "pnk_core"
 [features]
 # Folder-backed fake device, for the GUI's debug-only fake mode. Never enable in release builds.
 fake-device = []
+# Test helpers the app's tests use (such as the cleanup of the S3 test prefix). Never enable in
+# a normal or release build; the app turns it on only under its dev-dependencies.
+test-support = []
 
 [lints]
 workspace = true
@@ -30,6 +33,15 @@ walkdir = "2"
 uuid = { version = "1", default-features = false, features = ["v4"] }
 # Writes the JPG copies of HEIC photos (pure Rust, MIT OR Apache-2.0).
 jpeg-encoder = "0.7.1"
+# S3 request signing and response parsing (BSD-2-Clause). Only the XML parsers, not the rest.
+rusty-s3 = { version = "0.12", default-features = false, features = ["rustcrypto", "xml"] }
+# Blocking HTTP with rustls (ring) and the bundled web roots: no OpenSSL.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# SHA-256 of every upload part, sent so the server can refuse bytes that arrive damaged (already
+# in the build through rusty-s3).
+sha2 = { version = "0.11", default-features = false }
+# Address parsing for the signed requests (already in the build through rusty-s3).
+url = "2"
 
 [target.'cfg(windows)'.dependencies]
 # The `implement` macro expands to paths in this crate by name.

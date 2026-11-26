@@ -7,7 +7,8 @@
 ## 1. What it is
 
 A desktop app for Windows, Linux and FreeBSD ([§4.1](#41-platforms)). It backs up a USB device to
-a folder on the computer, and keeps everything that was ever on it.
+a folder on the computer or in an S3 bucket ([§11](#11-backup-destinations)), and keeps everything
+that was ever on it.
 
 - You plug in a device: a phone, a camera, a USB stick, an SD card or a USB drive.
 - The app recognises a device it has seen before, and loads its backup folder and settings.
@@ -38,9 +39,12 @@ Every device kind keeps these.
      one. Nothing leaves the backup folder.
    - **Recycle Bin / Trash:** the file leaves the backup folder and can be restored. It is never a
      permanent delete: if the bin can't take a file (none on that drive, too big, a network
-     share), the file stays where it is and the app says so.
+     share), the file stays where it is and the app says so. A bucket has no bin
+     ([§11](#11-backup-destinations)).
 3. **A file is saved whole, or not at all.** It is copied to a temporary file that must be exactly
    the size the device reported, flushed to disk, and moved into place without replacing anything.
+   In a bucket an upload appears only when finished, and never replaces a file
+   ([§11](#11-backup-destinations)).
 4. **One backup folder per device.** A marker file in the folder says which device it belongs to.
    A different device is refused, so one device's files are never archived as "deleted" from
    another's.
@@ -166,8 +170,8 @@ Nothing important is kept only in the app-data folder. Each backup folder holds 
 record ([§6.5](#65-the-device-record-and-the-history), [§9](#9-what-it-stores-on-the-computer)).
 
 On a new PC, or after the app-data folder is lost, **Add an existing backup…** (or **Find my
-backups**) reads a backup folder, or the markers one level below a folder, and sets each device up
-again. Both look in the folder itself and in the folders directly inside it, never deeper, and
+backups**) reads a backup folder or a place in a bucket, or the markers one level below it, and
+sets each device up again. Both look in the folder itself and in the folders directly inside it, never deeper, and
 recognise a backup by its `.plug-n-keep.json` marker. A device plugged in afterwards is recognised
 exactly as before. If a known device's folder
 has moved, the app says so and you point it at the new place; the marker confirms it's the right
@@ -232,7 +236,8 @@ choice covers the old copy of a changed file ([§7.3](#73-a-file-that-changed)):
 | **Recycle Bin** (Trash on Linux and FreeBSD) | sent to the bin | sent to the bin; the new copy takes its place |
 
 There is no permanent-delete choice. The archive name and layout matter only for **Archive**, and
-keep their values when another choice is made.
+keep their values when another choice is made. A bucket offers only **Archive** and **Leave in
+place** ([§11](#11-backup-destinations)).
 
 **The bin is never a way to delete.** It is the one place the app asks the system to move a file
 somewhere it doesn't control, so each move is guarded:
@@ -251,7 +256,8 @@ always inside the backup folder.
 **The archive's name** is set per device (the default for new devices is `_Archive`). It must be
 one safe Windows name and not one the device uses at the top of the backup
 (`app/src/validate.rs`, `core/src/owner.rs`). The app offers to rename the folder on disk too, as
-one move after the same checks as any archive move. The marker keeps every name it has had, and a
+one move after the same checks as any archive move (not in a bucket, where it would copy every
+file in it). The marker keeps every name it has had, and a
 folder under any of them is never treated as backup content. Otherwise the old archive would look
 like files deleted from the device, and be archived.
 
@@ -441,7 +447,7 @@ A list of devices on the left; the chosen device's page on the right, with Scan,
 tabs for Files, Problems, Skip list, History and Settings.
 
 - **Devices:** connected first, then known ones greyed out with their last sync. A device's menu
-  has **Rename**, **Forget** and **Open backup folder**. **Forget** only takes the device off the
+  has **Rename**, **Forget** and **Open backup folder** (**Copy address** for a bucket). **Forget** only takes the device off the
   list (its pointer and display cache). Its backup folder and everything in it, history included,
   stay as they are, and **Add an existing backup…** brings the device back. Nothing is deleted.
 - **A missing backup folder** is flagged on the device's page: nothing can be backed up without
@@ -469,14 +475,16 @@ The state is in the backup folder; the app-data folder only points.
 | Where | What |
 |---|---|
 | backup folder | the mirrored files, the archive folder, and the state files of [§6.5](#65-the-device-record-and-the-history) |
-| app-data folder, `config.json` | the backups root last used, the log level, and what new devices start with |
-| app-data folder, `devices.json` | pointers only: each device's ID and backup folder, plus a display cache (name, kind, signal history, last seen) to list and recognise it while its folder is away. A device with no folder yet keeps its whole record here |
+| app-data folder, `config.json` | the backups root last used, the log level, and what new devices start with (Local mode; S3 mode's is in the `s3` folder, see [§11.7](#117-the-two-modes)) |
+| app-data folder, `mode.json` | the mode last used. Absent until S3 is first chosen |
+| app-data folder, `devices.json` | pointers only: each device's ID and backup folder (or the bucket's settings, never its keys), plus a display cache (name, kind, signal history, last seen) to list and recognise it while its folder is away. A device with no folder yet keeps its whole record here. In S3 mode it is only a cache of the bucket's list ([§11.7](#117-the-two-modes)) |
 | app-data folder, other files | skip lists and history of a device with no folder yet (they move into the folder when it exists), the copy in progress for crash recovery, and a single-instance lock |
 
 - The app-data folder is `%APPDATA%\plug-n-keep\` on Windows and `$XDG_CONFIG_HOME/plug-n-keep/`
   (normally `~/.config/plug-n-keep/`) on Linux and FreeBSD. The log is kept in memory only.
 - **Forget** removes only the device's pointer and cache. It deletes nothing, in the backup folder
-  or here: a history copy kept here for a device with no folder yet stays where it is.
+  or here: a history copy kept here for a device with no folder yet stays where it is. In S3 mode
+  it adds the device's ID to the bucket's list of forgotten devices instead ([§11.7](#117-the-two-modes)).
 - Losing the app-data folder loses nothing: on a fresh install, copy the backup folder across and
   **Add an existing backup…**.
 - An older `devices.json` that kept a device whole is moved into the device's folder once, safely
@@ -498,8 +506,8 @@ The state is in the backup folder; the app-data folder only points.
 - `core/` (`pnk-core`) has no GUI. Everything outside `core/src/platform/` is portable and builds
   on all three systems; everything that talks to the operating system or a device lives under
   `core/src/platform/` (`windows/`, `linux/`, `freebsd/`).
-- Main core modules: `plan` and `sync` (scan and sync logic), `state`, `owner` (ownership of the
-  folder and its names), `recognise` and `signals` (matching), `registry` (known devices), `volume`
+- Main core modules: `plan` and `sync` (scan and sync logic), `state`, `store` (where a backup
+  lives, [§11](#11-backup-destinations)), `owner` (ownership of the folder and its names), `recognise` and `signals` (matching), `registry` (known devices), `volume`
   (read-only walk of a mounted file system), `idfile`, `space`, `history`, `jpgs` and `heic`, and
   `fake` (the fake device the end-to-end tests use).
 - `app/` (`plug-n-keep`) is the egui window. `worker.rs` is the one thread that talks to devices;
@@ -548,3 +556,168 @@ breaks one fails CI rather than waiting for review.
 - Recognition and the ID file are tested with made-up signal sets and fake sticks.
 - Windows tests that use the real Recycle Bin rules are `#[ignore]`d and run only by hand, with the
   owner present.
+
+## 11. Backup destinations
+
+A device's backup is in a folder on the computer or in a folder (a prefix) in a bucket on an
+S3-compatible server. Which one is decided by the app's mode ([§11.7](#117-the-two-modes)).
+Everything above holds for both; this section is what a bucket changes.
+
+### 11.1 The store layer
+
+Backup code does not touch the disk directly. It uses `BackupStore` (`core/src/store/`), a small set
+of operations on paths relative to the backup's root: list, stat, read, write without replacing,
+replace if unchanged, send a file in, move without replacing, and a few for crash recovery. There is
+a folder store and a bucket store (`store/s3/`). A device's `Destination` is a folder or the
+bucket's settings (provider, server, region, bucket, folder in the bucket, profile, optional
+credentials file, address style and CA file; Cloudflare R2 also its account ID). The provider's own
+fields (an AWS region, an R2 account ID, a B2 endpoint, a Wasabi region) are turned into the server,
+region and address style the store uses when the settings are saved, and the store looks only at
+those (`store/s3/provider.rs`). It never holds keys.
+
+Keys come from the environment (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`), else from a
+profile of an AWS-style credentials file (`store/creds.rs`). They are not logged, shown or written
+to the bucket, and error messages leave out signed addresses. Requests are signed by `rusty-s3` and
+sent by `ureq` with rustls, one at a time, each tried up to three times.
+
+A bucket has no folders, no rename and no bin: the Recycle Bin choice is not offered, and the
+archive folder is not renamed. Free space is not checked.
+
+### 11.2 How each operation maps
+
+- **Copy:** the file is uploaded in 16 MiB parts, one at a time, and finished with a write that
+  refuses to replace anything. Nothing is visible before the finish, so Stop and Skip abort the
+  upload and leave nothing. A small file is one request.
+- **Archive and leave in place:** a server-side copy that refuses to replace and fails if the
+  original changed, a check that the copy has the same size, modified time and checksum, then a
+  delete of the original that fails if it changed. A stop between the two leaves both. No file data
+  crosses the network, and a file over 5 GiB is copied in parts.
+- **A changed file** keeps the order of [§7.3](#73-a-file-that-changed): the new copy is uploaded in
+  full but not finished (staged), then the old copy is moved away, then the upload is finished.
+- **State files** ([§6.5](#65-the-device-record-and-the-history)) are small objects. The marker is
+  claimed with a write that refuses to replace; later writes succeed only if the object is as it was
+  read. If another writer got there first, the app reads again and retries, or refuses.
+
+### 11.3 Checks
+
+- **The server self-test.** The first time the app connects it writes a probe object
+  `.plug-n-keep-probe-<id>` under the prefix, checks that a second no-replace write and a write with
+  a wrong version are both refused, that a server-side copy onto an existing key (no-replace) is
+  refused, and that a copy whose source version is wrong is refused (archive moves rely on both).
+  The probe objects are deleted afterwards, each only if unchanged. A server that accepts any of
+  these would let a file be overwritten, so it is not used. With no right to write there is nothing to check, and writes would
+  be refused anyway. The probe is an app file, never backup content
+  ([§6.4](#64-what-the-scan-never-treats-as-backup-content)).
+- **Checksums.** The self-test also sends a probe write with a correct checksum and one with a
+  wrong one. A server that does not know the header (400 InvalidArgument or 501) is used without
+  it, and Test says so. A server that takes a wrong checksum is used too, with a note that it does
+  not verify them.
+- **Checksums and retries.** Every write carries a SHA-256 the server checks, and a random token
+  stored with the object. When a request had to be sent again, "already exists" or "no such upload"
+  counts as success only if the object there has this write's token and size (for a copy: the
+  source's size, modified time and checksum, with the source unchanged). Otherwise it is treated as
+  somebody else's file.
+
+### 11.4 Crash record and recovery
+
+The crash record stays in the app-data folder of the mode it was made in, and names the upload
+instead of a temporary file's path ([§7.3](#73-a-file-that-changed)). On every start the records of
+both modes are dealt with, whichever mode the app opens in. A bucket that can't be reached keeps
+its record for the next start. In a bucket:
+- **A staged upload** is finished if the old copy is out of the way and the server holds all of it:
+  parts in order, adding up to the recorded size. Otherwise it is dropped, and the next sync copies
+  the file again.
+- **A move cut between copy and delete** leaves both copies. The original is deleted only if the
+  copy has the same size, modified time and checksum and the original is unchanged. Otherwise both
+  stay.
+- **Stale uploads:** unfinished uploads under the backup's prefix that are more than a day old are
+  aborted. The wait is so that another copy of the app that is uploading is never cut off.
+
+### 11.5 Modified times
+
+A bucket's listing has no device modified times. Every upload stores the device's time with the
+object, and `.plug-n-keep-mtimes.json` at the top of the backup caches path, size, version tag and
+time, so a scan of a stick or card (compared by date, [§7.2](#72-is-it-backed-up)) doesn't need a
+request per file.
+
+- **The listing is the truth.** An entry counts only when its size and tag equal the listing's.
+- **One read** at the start of a scan, one write at the end of a sync, and one about every 15
+  minutes during a long one. If another writer changed it meanwhile, theirs is read and this run's
+  entries are put on top.
+- **A missing entry** costs one request for that object's time.
+- **Files put there by another tool** have no stored time. They match by name and size, and the
+  device's time is recorded, so nothing is uploaded again. On that first sync, a file on a stick
+  that changed but kept its size is not noticed. Phones compare name and size only
+  ([§7.2](#72-is-it-backed-up)) and are unaffected.
+- **Losing the cache is harmless.** **Rebuild modified-time cache** replaces it with an empty one
+  and deletes nothing. Folders never use it.
+
+### 11.6 Places and JPG copies
+
+- **No nesting.** In one bucket on one server, a device's prefix may not contain or sit inside
+  another device's (an empty prefix is the whole bucket), as with folders
+  ([§4](#4-devices)). Two spellings of one address are the same place. A folder and a bucket never
+  overlap. Setup refuses a nested place.
+- **Finding backups** looks for a marker at the given prefix, else one level below it (a listing
+  with `/` as the delimiter), as in [§5.3](#53-when-the-apps-own-records-are-lost).
+- **JPG copies** ([§7.6](#76-jpg-copies-of-heic-photos)): the decoders need a file, so the HEIC
+  (up to 512 MiB) is read from the bucket into a temporary file in the system's temp folder and decoded;
+  the file is removed afterwards. The JPG is uploaded with the HEIC's modified time and appears only if its name is free.
+- **No network** means no scan or sync, with the message "No network: can't reach …". The device
+  stays in the list.
+
+### 11.7 The two modes
+
+The app is in **Local** or **S3** mode, chosen with a switch at the top of the window, and starts
+in the mode last used (`mode.json` in the app-data folder; no file means Local).
+
+- **Separate lists.** Local mode uses the app-data folder as it always did. S3 mode uses the `s3`
+  folder inside it: its own `devices.json`, `config.json` (the connection: the S3 server's settings,
+  whose folder is the base folder), skip-list and history fallbacks and crash record. The
+  single-instance lock stays one for the whole app. A device set up in both modes is two devices.
+- **The bucket is the source of truth in S3 mode.** The PC keeps only the connection, the mode, the
+  crash record and a disposable cache: `devices.json` (the device list) and the `new_devices` part of
+  `config.json` (a copy of the bucket's settings). The cache is only used to show something quickly
+  and while the bucket is away; whatever the bucket can answer, the bucket answers.
+- **Every device's folder is directly inside the base folder** (`<base>/<name>/`, one name with no
+  `/`), so a PC with only the connection finds them all. Setup, Change… and Find it… ask for the
+  name only, and the worker refuses any other place. A device kept from an earlier version outside
+  the base folder keeps working from the cache and is shown with a note; nothing is moved.
+- **The device list** (`core/src/bucket_list.rs`, `store/find.rs`) is read on a thread at start, on
+  Refresh, after Settings is saved and on a switch to S3 mode: every folder directly under the base
+  folder with a readable marker (the base folder itself is never a device). A device's record in the
+  bucket is authoritative for its name, settings and recognition signals (what this PC learned about
+  signals is kept too) and refreshes the cache. A folder with a marker but no usable record is listed
+  with a note. One device ID in two folders is a problem line, and nothing is picked. A listed device
+  the bucket doesn't show stays (a new device before its first sync, or one outside the base folder);
+  only a forgotten one is taken off. A plugged-in device waits a few seconds for the list before it is
+  matched. Changes to a device are written to its record in the bucket when they are made, and not
+  made while the bucket can't be reached.
+- **Settings for every PC** (`core/src/bucket_settings.rs`) are one object, `.plug-n-keep-settings.json`
+  in the base folder: what new devices start with and the forgotten IDs. It is read with the list and
+  replaced only if its version tag is still the one read (`If-Match`); the first write when there is none
+  is `If-None-Match`. A lost race shows the other PC's settings and asks to save again. Adding or
+  removing a forgotten ID is repeated against the newest copy, so it never loses another PC's change.
+  A damaged object is never replaced. Its name starts with `.plug-n-keep`, so a scan never counts it as
+  content ([§6.4](#64-what-the-scan-never-treats-as-backup-content)).
+- **Offline, no access, unsupported server:** the list is the cache, marked with what is wrong; Scan
+  and Sync are off as for any bucket; the connection can still be edited and tested, and the bucket's
+  settings are shown read-only.
+- **Switching** hands the worker the other mode's list: the open device, the scan and the forms
+  are let go, and the plugged-in devices are looked at again, in the new mode. It is not allowed
+  while a scan, sync, archive step or JPG job runs. Nothing is copied between the modes.
+- **Settings show only the current mode's.** Local: the backups folder and what new devices start
+  with. S3: the S3 server (provider, its fields, base folder, profile, credentials file, Test) and
+  what new devices start with, without the Recycle Bin choice. The log level is the whole app's and
+  is kept with the Local settings.
+- **Places.** Local offers a folder to pick; S3 offers a folder in the bucket, made from the base
+  folder and the device's name, with the rest from the S3 server's settings.
+- **At start**, bucket devices found in the Local list (from an earlier version) move to the S3 list
+  once, with the default S3 location. A device whose ID the S3 list already has with a different
+  record stays in the Local list and is logged. The old `devices.json` is first copied to
+  `devices.json.pre-s3-move`. Nothing in a backup folder or bucket is touched
+  (`core/src/modes.rs`). The S3 `config.json` and `devices.json` are also copied once to
+  `*.pre-bucket-source` before the app first uses them the new way; the connection stays where it
+  was, and a copy that is there is never replaced.
+- **Command line.** `--state-dir <folder>` (any build) makes `<folder>` Local's app-data folder and
+  `<folder>/s3` S3's.

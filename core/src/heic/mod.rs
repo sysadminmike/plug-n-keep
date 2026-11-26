@@ -20,8 +20,8 @@ mod pixels;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
-use std::time::SystemTime;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use log::{debug, warn};
 
@@ -243,6 +243,45 @@ pub fn make_jpeg(heic: &Path, jpg: &Path, quality: u8) -> Result<MadeInfo, MakeE
     if fs::symlink_metadata(jpg).is_ok() {
         return Err(MakeError::TargetExists);
     }
+    let (bytes, info) = convert(heic, quality)?;
+    let modified = info.heic_modified;
+    let name = jpg
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| MakeError::Io("no file name".into()))?;
+    // A suffix of its own, which the copy step never produces (its temp is a device file's name
+    // plus `.pnk-part`) and which no device file may use, so a stale one left by a crash is
+    // ours to remove, never a device file's copy in progress.
+    let temp = jpg.with_file_name(crate::paths::fit_name(&name, JPG_TEMP_SUFFIX));
+    let _ = fs::remove_file(&temp);
+    let written = (|| {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        f.write_all(&bytes)?;
+        crate::platform::flush_file(&f)?;
+        crate::platform::set_modified(&f, modified)
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&temp);
+        return Err(io_err(e));
+    }
+    if let Err(e) = crate::platform::rename_no_replace(&temp, jpg) {
+        let _ = fs::remove_file(&temp);
+        return Err(if e.kind() == std::io::ErrorKind::AlreadyExists {
+            MakeError::TargetExists
+        } else {
+            io_err(e)
+        });
+    }
+    debug!("Made {} from {}", jpg.display(), heic.display());
+    Ok(info)
+}
+
+/// Decodes the HEIC file `heic` and encodes it as a JPG, in memory. Nothing is written.
+pub fn convert(heic: &Path, quality: u8) -> Result<(Vec<u8>, MadeInfo), MakeError> {
+    let io_err = |e: std::io::Error| MakeError::Io(e.to_string());
     let meta = fs::metadata(heic).map_err(|e| MakeError::Damaged(e.to_string()))?;
     if !meta.is_file() {
         return Err(MakeError::Damaged("it is not a file".into()));
@@ -333,51 +372,170 @@ pub fn make_jpeg(heic: &Path, jpg: &Path, quality: u8) -> Result<MadeInfo, MakeE
     enc.encode(&image.data, w, h, jpeg_encoder::ColorType::Rgb)
         .map_err(|e| MakeError::Io(format!("encoding failed: {e}")))?;
     drop(image);
+    Ok((
+        bytes,
+        MadeInfo {
+            width: u32::from(w),
+            height: u32::from(h),
+            heic_size: meta.len(),
+            heic_modified: modified,
+            kept_exif,
+            kept_icc,
+        },
+    ))
+}
 
-    let name = jpg
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| MakeError::Io("no file name".into()))?;
-    // A suffix of its own, which the copy step never produces (its temp is a device file's name
-    // plus `.pnk-part`) and which no device file may use, so a stale one left by a crash is
-    // ours to remove, never a device file's copy in progress.
-    let temp = jpg.with_file_name(crate::paths::fit_name(&name, JPG_TEMP_SUFFIX));
-    let _ = fs::remove_file(&temp);
-    let written = (|| {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        f.write_all(&bytes)?;
-        crate::platform::flush_file(&f)?;
-        crate::platform::set_modified(&f, modified)
-    })();
-    if let Err(e) = written {
-        let _ = fs::remove_file(&temp);
-        return Err(io_err(e));
+/// [`convert`] for a HEIC that is not in a file: the decoders read a path, so the bytes go to a
+/// temporary file of ours in the system's temp folder (`plug-n-keep-<pid>-<n>.<ext>`, made new,
+/// removed again whatever happens). `name` is the HEIC's name (its extension is kept) and
+/// `modified` its modified time, which the result carries (the epoch if unknown).
+pub fn convert_bytes(
+    bytes: &[u8],
+    name: &str,
+    modified: Option<SystemTime>,
+    quality: u8,
+) -> Result<(Vec<u8>, MadeInfo), MakeError> {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let ext = extension(name).unwrap_or("heic");
+    let ext: String = ext.chars().filter(char::is_ascii_alphanumeric).collect();
+    let mut tries = 0;
+    let (path, mut file) = loop {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "plug-n-keep-{}-{n}.{}",
+            std::process::id(),
+            if ext.is_empty() { "heic" } else { &ext }
+        ));
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        // Only this user may read the photo while it waits.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        match opts.open(&path) {
+            Ok(f) => break (path, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 50 => tries += 1,
+            Err(e) => return Err(MakeError::Io(format!("no temporary file ({e})"))),
+        }
+    };
+    // Removes exactly the file made above, however this function ends (an early return or a panic).
+    let _guard = TempFile(path.clone());
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| crate::platform::flush_file(&file));
+    // Closed before the decoder opens it (Windows would otherwise refuse).
+    drop(file);
+    match written {
+        Ok(()) => convert(&path, quality).map(|(jpg, mut info)| {
+            info.heic_modified = modified.unwrap_or(std::time::UNIX_EPOCH);
+            info.heic_size = bytes.len() as u64;
+            (jpg, info)
+        }),
+        Err(e) => Err(MakeError::Io(format!("no temporary file ({e})"))),
     }
-    if let Err(e) = crate::platform::rename_no_replace(&temp, jpg) {
-        let _ = fs::remove_file(&temp);
-        return Err(if e.kind() == std::io::ErrorKind::AlreadyExists {
-            MakeError::TargetExists
-        } else {
-            io_err(e)
-        });
+}
+
+/// Removes its path when dropped: the temporary file `convert_bytes` made, and no other.
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
     }
-    debug!("Made {} from {}", jpg.display(), heic.display());
-    Ok(MadeInfo {
-        width: u32::from(w),
-        height: u32::from(h),
-        heic_size: meta.len(),
-        heic_modified: modified,
-        kept_exif,
-        kept_icc,
-    })
+}
+
+/// Whether `name` is exactly `plug-n-keep-<pid>-<n>.<ext>` as `convert_bytes` names its temp file.
+fn is_our_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("plug-n-keep-") else {
+        return false;
+    };
+    let Some((stem, ext)) = rest.split_once('.') else {
+        return false;
+    };
+    let Some((pid, n)) = stem.split_once('-') else {
+        return false;
+    };
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    digits(pid) && digits(n) && !ext.is_empty() && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Removes temp files that `convert_bytes` left in `dir` (a crash or kill) when they are older
+/// than `age`. Only files named exactly as it names them are touched. Returns how many went.
+fn sweep_temps_in(dir: &Path, age: Duration) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(is_our_temp_name) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|e| e >= age);
+        if meta.is_file() && old && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Once at start: removes temp files of ours left by an earlier run that died (older than a
+/// day, so a run that is going now is never touched).
+pub fn sweep_stale_temps() {
+    let n = sweep_temps_in(&std::env::temp_dir(), Duration::from_secs(24 * 60 * 60));
+    if n > 0 {
+        log::info!("Removed {n} leftover temporary file(s) of an earlier run");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sweep_removes_only_old_files_named_as_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = |n: &str| {
+            let p = dir.path().join(n);
+            fs::write(&p, b"x").unwrap();
+            p
+        };
+        let ours = make("plug-n-keep-123-4.heic");
+        let others = [
+            make("plug-n-keep-123-4.heic.bak"),
+            make("plug-n-keep-abc-4.heic"),
+            make("plug-n-keep-123.heic"),
+            make("plug-n-keep-.heic"),
+            make("plug-n-keep-123-4."),
+            make("my-plug-n-keep-123-4.heic"),
+            make("photo.heic"),
+        ];
+        // Nothing is old enough yet.
+        assert_eq!(sweep_temps_in(dir.path(), Duration::from_secs(3600)), 0);
+        assert!(ours.exists());
+        // With no age limit, only the one named exactly as ours goes.
+        assert_eq!(sweep_temps_in(dir.path(), Duration::ZERO), 1);
+        assert!(!ours.exists());
+        assert!(others.iter().all(|p| p.exists()));
+    }
+
+    #[test]
+    fn the_temp_file_guard_removes_its_own_path_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mine, other) = (dir.path().join("mine"), dir.path().join("other"));
+        fs::write(&mine, b"x").unwrap();
+        fs::write(&other, b"x").unwrap();
+        let r = std::panic::catch_unwind(|| {
+            let _g = TempFile(dir.path().join("mine"));
+            panic!("boom");
+        });
+        assert!(r.is_err());
+        assert!(!mine.exists() && other.exists());
+    }
 
     #[test]
     fn names_follow_the_case_of_the_original() {

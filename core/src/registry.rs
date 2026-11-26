@@ -23,6 +23,7 @@ use crate::owner::{self, OwnerState};
 use crate::paths::is_link;
 use crate::signals::{DeviceKind, SignalKind, Signals, View};
 use crate::state::StateDir;
+use crate::store::{Destination, S3Config};
 
 const DEVICES_FILE: &str = "devices.json";
 /// The most values the history keeps for one kind of signal; the oldest go first. A memory card
@@ -359,9 +360,15 @@ pub struct KnownDevice {
     #[serde(default)]
     pub view: Option<View>,
     pub history: SignalHistory,
-    /// Where its backup is. `None` until one is chosen.
+    /// Where its backup is, when it is a folder on this PC. `None` until one is chosen, and for a
+    /// backup in a bucket (see [`KnownDevice::s3`]).
     #[serde(default)]
     pub backup_dir: Option<PathBuf>,
+    /// Where its backup is, when it is a place in a bucket. No keys are kept here (the profile
+    /// names them). Left out of the file for a folder device, so those files read and write as
+    /// they always did. Never set together with `backup_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3: Option<S3Config>,
     pub first_seen: String,
     pub last_seen: String,
     #[serde(default)]
@@ -393,12 +400,36 @@ impl KnownDevice {
             view: None,
             history: SignalHistory::from_signals(signals),
             backup_dir: None,
+            s3: None,
             first_seen: now.to_string(),
             last_seen: now.to_string(),
             last_sync: None,
             not_this: Vec::new(),
             settings: DeviceSettings::defaults_for_device(kind, signals),
             offline: None,
+        }
+    }
+
+    /// Where its backup is: the folder, or the place in a bucket. `None` until one is chosen.
+    pub fn destination(&self) -> Option<Destination> {
+        match (&self.s3, &self.backup_dir) {
+            (Some(c), _) => Some(Destination::S3(c.clone())),
+            (None, Some(p)) => Some(Destination::Local(p.clone())),
+            (None, None) => None,
+        }
+    }
+
+    /// Makes `dest` the backup place, clearing the other kind.
+    pub fn set_destination(&mut self, dest: Destination) {
+        match dest {
+            Destination::Local(p) => {
+                self.backup_dir = Some(p);
+                self.s3 = None;
+            }
+            Destination::S3(c) => {
+                self.backup_dir = None;
+                self.s3 = Some(c);
+            }
         }
     }
 
@@ -831,6 +862,61 @@ impl Registry {
             .then(|| folder_record::history_file(dir))
     }
 
+    /// Where the device's sync history is kept: in its folder, in its bucket, or (when its record
+    /// is not in a backup place yet) in the settings folder.
+    pub fn history_home(&self, id: &str) -> HistoryHome {
+        match self.get(id).and_then(KnownDevice::destination) {
+            Some(Destination::S3(c)) => HistoryHome::Store(Destination::S3(c)),
+            _ => self
+                .history_file(id)
+                .map_or(HistoryHome::Profile, HistoryHome::Folder),
+        }
+    }
+
+    /// "Change…" to any place: a folder as [`Self::set_backup_dir`], a bucket the same way (the
+    /// record goes into it and the history is copied across, when the bucket can be reached; if
+    /// not, the place is still changed and the next sync writes them). The old place's files are
+    /// left as they are. Returns what went wrong, if anything.
+    pub fn set_destination(
+        &mut self,
+        state: &StateDir,
+        id: &str,
+        dest: Destination,
+    ) -> Result<(), String> {
+        let cfg = match dest {
+            Destination::Local(dir) => return self.set_backup_dir(state, id, dir),
+            Destination::S3(cfg) => cfg,
+        };
+        let from = self
+            .history_file(id)
+            .unwrap_or_else(|| History::new(state).profile_file(id));
+        let Some(d) = self.get_mut(id) else {
+            return Ok(());
+        };
+        d.set_destination(Destination::S3(cfg.clone()));
+        d.offline = None;
+        let d = d.clone();
+        self.frozen.remove(id);
+        let store = Destination::S3(cfg)
+            .open()
+            .map_err(|e| format!("Could not open the bucket: {e}"))?;
+        if folder_record::fit_in(&*store, id) != Fit::Ok {
+            return Ok(());
+        }
+        folder_record::write_device_in(&*store, &d)
+            .map_err(|e| format!("Could not write the record into {}: {e}", store.describe()))?;
+        folder_record::copy_history_into_in(&from, &*store).map_err(|e| {
+            format!(
+                "Could not copy the sync history into {}: {e}",
+                store.describe()
+            )
+        })?;
+        if from == History::new(state).profile_file(id) {
+            folder_record::retire_profile_history(&from);
+        }
+        Ok(())
+    }
+
     /// "Change…": the backup folder is now `dir`. If `dir` can hold the device's record, it is
     /// written there and the sync history is copied across (merged with any already there). The
     /// old folder's files are left as they are. Returns what went wrong, if anything; the
@@ -848,6 +934,7 @@ impl Registry {
             return Ok(());
         };
         d.backup_dir = Some(dir.clone());
+        d.s3 = None;
         d.offline = None;
         let d = d.clone();
         self.frozen.remove(id);
@@ -874,6 +961,7 @@ impl Registry {
         let cache_only = self.cache_only(id);
         let d = self.get_mut(id)?;
         d.backup_dir = Some(dir.to_path_buf());
+        d.s3 = None;
         d.offline = None;
         let was = d.clone();
         self.frozen.remove(id);
@@ -898,6 +986,181 @@ impl Registry {
                 ))
             }
         }
+    }
+
+    /// [`Self::rehome`] for any place: for a bucket, the record in it (if it has one) is the
+    /// device's from now on. Returns what went wrong reading it.
+    pub fn rehome_dest(&mut self, id: &str, dest: &Destination) -> Option<String> {
+        let cfg = match dest {
+            Destination::Local(dir) => return self.rehome(id, dir),
+            Destination::S3(cfg) => cfg,
+        };
+        let d = self.get_mut(id)?;
+        d.set_destination(Destination::S3(cfg.clone()));
+        d.offline = None;
+        let was = d.clone();
+        self.frozen.remove(id);
+        let label = dest.label().display().to_string();
+        let store = match dest.open() {
+            Ok(s) => s,
+            Err(e) => return Some(format!("Could not open {label} ({e})")),
+        };
+        match folder_record::read_device_in(&*store, id) {
+            Ok(Some(mut f)) => {
+                f.history.merge(&was.history);
+                f.set_destination(dest.clone());
+                *self.get_mut(id)? = f;
+                None
+            }
+            Ok(None) => None,
+            Err(e) => {
+                *self.get_mut(id)? = was;
+                Some(format!("The record in {label} can't be used ({e})"))
+            }
+        }
+    }
+
+    /// One backup found in a bucket (what "Find my backups" and "Add an existing backup" read
+    /// there): a device not in the list is added from the record in `dest` (or, for a backup
+    /// made before the record existed, from its marker); a known device whose place is elsewhere
+    /// is reported in `found.moved`, as for a folder.
+    pub fn found_in_store(
+        &mut self,
+        dest: &Destination,
+        device_id: &str,
+        device_name: &str,
+        now: &str,
+        found: &mut FoundBackups,
+    ) {
+        let label = dest.label();
+        if !is_sane_device_id(device_id) {
+            found.problems.push(format!(
+                "{} in {} has no usable device ID",
+                owner::MARKER,
+                label.display()
+            ));
+            return;
+        }
+        if self.get(device_id).is_some() {
+            self.found_known(device_id, dest, label, found);
+            return;
+        }
+        if let Some(other) = self.overlapping(dest) {
+            found.problems.push(overlap_problem(&label, &other));
+            return;
+        }
+        let store = match dest.open() {
+            Ok(s) => s,
+            Err(e) => {
+                found
+                    .problems
+                    .push(format!("could not open {} ({e})", label.display()));
+                return;
+            }
+        };
+        let device = match folder_record::read_device_in(&*store, device_id) {
+            Ok(Some(mut d)) => {
+                d.set_destination(dest.clone());
+                d
+            }
+            other => {
+                if let Err(e) = other {
+                    warn!(
+                        "The record in {} can't be used ({e}); it is rebuilt from the marker",
+                        label.display()
+                    );
+                }
+                let (kind, signals, view, archive) = match owner::read_in(&*store) {
+                    OwnerState::Owned(m) => (
+                        DeviceKind::guess_from(&m.signals),
+                        m.signals.clone(),
+                        m.view,
+                        m.archive_names.last().cloned(),
+                    ),
+                    _ => (DeviceKind::Ptp, Signals::default(), None, None),
+                };
+                let mut d =
+                    KnownDevice::with_id(device_id.to_string(), kind, device_name, &signals, now);
+                d.view = view;
+                if let Some(name) = archive.filter(|n| is_plain_folder_name(n)) {
+                    d.settings.archive_name = name;
+                }
+                d.set_destination(dest.clone());
+                d
+            }
+        };
+        info!(
+            "Found the backup of \"{}\" in {}",
+            device.name,
+            label.display()
+        );
+        found.added.push(device.name.clone());
+        found.added_at.push((device.id.clone(), label));
+        self.devices.push(device);
+    }
+
+    /// The device whose backup place overlaps `dest` (a folder inside another's, or the same
+    /// bucket prefix, and so on), if one does.
+    fn overlapping(&self, dest: &Destination) -> Option<KnownDevice> {
+        self.devices
+            .iter()
+            .find(|d| {
+                d.destination()
+                    .is_some_and(|o| crate::store::dest::overlaps(&o, dest))
+            })
+            .cloned()
+    }
+
+    /// A backup found for a device that is already in the list: the same place is known; a
+    /// different place is a move, unless that is not clear (the device has been found in two
+    /// places in this look, or its recorded place still holds its backup): then it is a
+    /// problem line and the device stays where it is.
+    fn found_known(&self, id: &str, dest: &Destination, label: PathBuf, found: &mut FoundBackups) {
+        let Some(known) = self.get(id) else { return };
+        let recorded = known.destination();
+        let same_folder_text = matches!(
+            (&recorded, dest),
+            (Some(Destination::Local(a)), Destination::Local(b)) if same_path(a, b)
+        );
+        if same_folder_text || recorded.as_ref().is_some_and(|k| k.same_place(dest)) {
+            found.already_known.push(known.name.clone());
+            return;
+        }
+        let two_places = |a: &Path, b: &Path| {
+            format!(
+                "\"{}\" has backups in {} and {}; pick one with Find it…",
+                known.name,
+                a.display(),
+                b.display()
+            )
+        };
+        // Found earlier in this look as a new device: that place was taken, this is the second.
+        if let Some((_, first)) = found.added_at.iter().find(|(i, _)| i == id) {
+            found.problems.push(two_places(first, &label));
+            return;
+        }
+        // Found earlier in this look as a move: neither place is taken.
+        if let Some(i) = found.moved.iter().position(|m| m.device_id == id) {
+            let first = found.moved.remove(i);
+            found.problems.push(two_places(&first.found, &label));
+            return;
+        }
+        if let Some(r) = recorded {
+            let still_there = r.open().is_ok_and(
+                |s| matches!(owner::read_in(&*s), OwnerState::Owned(m) if m.device_id == id),
+            );
+            if still_there {
+                found.problems.push(two_places(&r.label(), &label));
+                return;
+            }
+        }
+        found.moved.push(MovedBackup {
+            device_id: known.id.clone(),
+            name: known.name.clone(),
+            recorded: known.destination().map(|d| d.label()),
+            found: label,
+            destination: matches!(dest, Destination::S3(_)).then(|| dest.clone()),
+        });
     }
 
     pub fn devices(&self) -> &[KnownDevice] {
@@ -990,24 +1253,14 @@ impl Registry {
                 ));
                 return;
             }
+            let place = Destination::Local(dir.clone());
             match self.get(&marker.device_id) {
-                Some(known) => {
-                    if known
-                        .backup_dir
-                        .as_deref()
-                        .is_some_and(|p| same_path(p, &dir))
-                    {
-                        found.already_known.push(known.name.clone());
-                    } else {
-                        found.moved.push(MovedBackup {
-                            device_id: known.id.clone(),
-                            name: known.name.clone(),
-                            recorded: known.backup_dir.clone(),
-                            found: dir.clone(),
-                        });
-                    }
-                }
+                Some(_) => self.found_known(&marker.device_id, &place, dir.clone(), found),
                 None => {
+                    if let Some(other) = self.overlapping(&place) {
+                        found.problems.push(overlap_problem(&dir, &other));
+                        return;
+                    }
                     let kind = DeviceKind::guess_from(&marker.signals);
                     let from_marker = KnownDevice::with_id(
                         marker.device_id.clone(),
@@ -1026,11 +1279,25 @@ impl Registry {
                         dir.display()
                     );
                     found.added.push(device.name.clone());
+                    found.added_at.push((device.id.clone(), dir.clone()));
                     self.devices.push(device);
                 }
             }
         }
     }
+}
+
+/// Why a found backup was not added: its place overlaps another device's.
+fn overlap_problem(place: &Path, other: &KnownDevice) -> String {
+    let at = other
+        .destination()
+        .map(|d| d.label().display().to_string())
+        .unwrap_or_default();
+    format!(
+        "{} was not added: it overlaps the backup of \"{}\" ({at}). Each device needs a place of its own, with none inside another's",
+        place.display(),
+        other.name
+    )
 }
 
 /// Before `devices.json` is written with a device as pointers that it had whole (the old
@@ -1183,6 +1450,8 @@ pub struct FoundBackups {
     pub moved: Vec<MovedBackup>,
     /// Folders with a marker that couldn't be used, and read errors.
     pub problems: Vec<String>,
+    /// The id and place of each device added in this look (to spot a second place for it).
+    pub added_at: Vec<(String, PathBuf)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1191,6 +1460,19 @@ pub struct MovedBackup {
     pub name: String,
     pub recorded: Option<PathBuf>,
     pub found: PathBuf,
+    /// Where it was found, when that is a bucket (`found` is then its `s3://` label).
+    pub destination: Option<Destination>,
+}
+
+/// Where a device's sync history is kept ([`Registry::history_home`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryHome {
+    /// A file in the backup folder.
+    Folder(PathBuf),
+    /// A file in the bucket, through its store.
+    Store(Destination),
+    /// The settings folder: the device has no record in a backup place yet.
+    Profile,
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -1203,14 +1485,14 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 /// A device ID read from a file: short, printable, no spaces.
-fn is_sane_device_id(id: &str) -> bool {
+pub(crate) fn is_sane_device_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_graphic())
 }
 
 /// One plain folder name: no separators, no `:`, no dots-only, no control characters. The full
 /// rules for archive names come with the settings step; this only keeps a marker file from
 /// pointing outside the backup folder.
-fn is_plain_folder_name(name: &str) -> bool {
+pub(crate) fn is_plain_folder_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 255
         && name != "."
@@ -1794,6 +2076,167 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let mut reg = Registry::default();
         let found = reg.find_my_backups(&t.path().join("nope"), NOW);
+        assert_eq!(found.problems.len(), 1);
+    }
+
+    fn bucket_place(prefix: &str) -> Destination {
+        Destination::S3(S3Config {
+            provider: Default::default(),
+            account_id: None,
+            endpoint: "http://s3.example.test:9000".into(),
+            region: "us-east-1".into(),
+            bucket: "b".into(),
+            prefix: prefix.into(),
+            profile: None,
+            credentials_file: None,
+            path_style: true,
+            ca_file: None,
+        })
+    }
+
+    fn device_at(id: &str, name: &str, dest: Destination) -> KnownDevice {
+        let mut d =
+            KnownDevice::with_id(id.into(), DeviceKind::Ptp, name, &Signals::default(), NOW);
+        d.set_destination(dest);
+        d
+    }
+
+    #[test]
+    fn a_found_folder_inside_another_devices_folder_is_not_added() {
+        let t = tempfile::tempdir().unwrap();
+        let outer = t.path().join("outer");
+        write_marker(&outer, "id-1", "Outer", Signals::default(), &[]);
+        write_marker(
+            &outer.join("inner"),
+            "id-2",
+            "Inner",
+            Signals::default(),
+            &[],
+        );
+        let mut reg = Registry::new(vec![device_at(
+            "id-1",
+            "Outer",
+            Destination::Local(outer.clone()),
+        )]);
+        let found = reg.find_my_backups(&outer.join("inner"), NOW);
+        assert!(found.added.is_empty(), "{found:?}");
+        assert_eq!(found.problems.len(), 1);
+        assert!(found.problems[0].contains("overlaps"), "{found:?}");
+        assert_eq!(reg.devices().len(), 1);
+    }
+
+    #[test]
+    fn a_found_bucket_place_that_overlaps_another_device_is_not_added() {
+        let mut reg = Registry::new(vec![device_at("id-1", "Phone", bucket_place("phones/a"))]);
+        let mut found = FoundBackups::default();
+        // Inside the other's prefix, and the same prefix: both refused, before anything is opened.
+        for prefix in ["phones/a/b", "phones/a", "phones"] {
+            reg.found_in_store(&bucket_place(prefix), "id-2", "Other", NOW, &mut found);
+        }
+        assert!(found.added.is_empty(), "{found:?}");
+        assert_eq!(found.problems.len(), 3, "{found:?}");
+        assert!(found.problems.iter().all(|p| p.contains("overlaps")));
+        assert_eq!(reg.devices().len(), 1);
+    }
+
+    #[test]
+    fn a_device_found_in_two_places_is_not_moved_to_either() {
+        let t = tempfile::tempdir().unwrap();
+        write_marker(
+            &t.path().join("A"),
+            "id-1",
+            "Phone",
+            Signals::default(),
+            &[],
+        );
+        write_marker(
+            &t.path().join("B"),
+            "id-1",
+            "Phone",
+            Signals::default(),
+            &[],
+        );
+        let mut known = device_at(
+            "id-1",
+            "Phone",
+            Destination::Local(PathBuf::from(r"Z:\Gone")),
+        );
+        known.backup_dir = Some(t.path().join("nowhere"));
+        let mut reg = Registry::new(vec![known]);
+        let found = reg.find_my_backups(t.path(), NOW);
+        assert!(found.moved.is_empty(), "{found:?}");
+        assert_eq!(found.problems.len(), 1, "{found:?}");
+        assert!(found.problems[0].contains("has backups in"));
+        assert!(found.problems[0].contains("Find it"));
+        assert_eq!(
+            reg.get("id-1").unwrap().backup_dir.as_deref(),
+            Some(t.path().join("nowhere").as_path())
+        );
+    }
+
+    #[test]
+    fn a_new_device_found_in_two_places_keeps_the_first_and_reports_the_second() {
+        let t = tempfile::tempdir().unwrap();
+        write_marker(
+            &t.path().join("A"),
+            "id-1",
+            "Phone",
+            Signals::default(),
+            &[],
+        );
+        write_marker(
+            &t.path().join("B"),
+            "id-1",
+            "Phone",
+            Signals::default(),
+            &[],
+        );
+        let mut reg = Registry::default();
+        let found = reg.find_my_backups(t.path(), NOW);
+        assert_eq!(found.added.len(), 1, "{found:?}");
+        assert!(found.moved.is_empty());
+        assert_eq!(found.problems.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn a_found_place_for_a_device_whose_recorded_place_still_has_its_backup_is_a_problem() {
+        let t = tempfile::tempdir().unwrap();
+        write_marker(
+            &t.path().join("A"),
+            "id-1",
+            "Phone",
+            Signals::default(),
+            &[],
+        );
+        write_marker(
+            &t.path().join("B"),
+            "id-1",
+            "Phone",
+            Signals::default(),
+            &[],
+        );
+        let mut reg = Registry::new(vec![device_at(
+            "id-1",
+            "Phone",
+            Destination::Local(t.path().join("A")),
+        )]);
+        let found = reg.find_my_backups(&t.path().join("B"), NOW);
+        assert!(found.moved.is_empty(), "{found:?}");
+        assert_eq!(found.problems.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn two_bucket_places_with_one_device_id_are_not_applied() {
+        let mut reg = Registry::new(vec![device_at(
+            "id-1",
+            "Phone",
+            Destination::Local(PathBuf::from(r"Z:\Gone")),
+        )]);
+        let mut found = FoundBackups::default();
+        reg.found_in_store(&bucket_place("x/a"), "id-1", "Phone", NOW, &mut found);
+        assert_eq!(found.moved.len(), 1);
+        reg.found_in_store(&bucket_place("x/b"), "id-1", "Phone", NOW, &mut found);
+        assert!(found.moved.is_empty(), "{found:?}");
         assert_eq!(found.problems.len(), 1);
     }
 

@@ -6,22 +6,25 @@
 //! [`crate::folder_record`]). A device with no backup folder yet keeps it in the settings folder:
 //!
 //! `<settings folder>/history/<device id>.jsonl`, one JSON object ([`SyncRecord`]) per line,
-//! oldest first. A sync adds its line with a single write that is flushed to disk. At most
+//! oldest first. A sync adds its line by reading the file and writing it back with the line added, only if it is unchanged. At most
 //! [`KEEP`] records are kept: when a new line takes the file over that, it is rewritten with the
-//! newest [`KEEP`] (through a temporary file and an atomic move). A line that can't be read
+//! newest [`KEEP`] (in the same write). A line that can't be read
 //! (a crash mid-write, an edit) is skipped and never stops the others loading.
 //!
 //! Forgetting a device leaves every history file alone, in its backup folder and here.
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use log::warn;
 use serde::{Deserialize, Serialize};
 
+use crate::folder_record::HISTORY_FILE;
+use crate::paths::SafeRelPath;
 use crate::registry::DeletedFiles;
 use crate::state::StateDir;
+use crate::store::{BackupStore, LocalStore, is_conflict};
 
 /// The most records kept for one device.
 pub const KEEP: usize = 500;
@@ -163,53 +166,82 @@ impl History {
     }
 }
 
-/// Add one record at the end of the history file `path`: one write, flushed to disk. Trims the
-/// file to the newest [`KEEP`] when it is over.
-pub fn append_at(path: &Path, record: &SyncRecord) -> io::Result<()> {
-    let is_new = !path.exists();
-    let mut line = serde_json::to_string(record).map_err(io::Error::other)?;
-    line.push('\n');
-    let mut f = OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(true)
-        .open(path)?;
-    // A crash may have left the last line without its end: start on a fresh line, or this
-    // record would be glued to the damaged one and lost with it.
-    let len = f.metadata()?.len();
-    if len > 0 {
-        f.seek(SeekFrom::End(-1))?;
-        let mut last = [0u8; 1];
-        f.read_exact(&mut last)?;
-        if last[0] != b'\n' {
-            line.insert(0, '\n');
-        }
-    }
-    f.write_all(line.as_bytes())?;
-    crate::platform::flush_file(&f)?;
-    drop(f);
-    if is_new
-        && let Some(dir) = path.parent()
-        && let Err(e) = crate::platform::flush_dir(dir)
-    {
-        // The record is written; only the new name may not survive a power cut.
-        warn!("Could not flush the history folder: {e}");
-    }
-    // The record is in. A trim that fails (the file stays long) is not a failed append.
-    if let Err(e) = trim_at(path) {
-        warn!("Could not trim a sync history: {e}");
-    }
-    Ok(())
+/// A file on this PC as a store and a name in it.
+fn local_of(path: &Path) -> io::Result<(LocalStore, SafeRelPath)> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a usable file name"))?;
+    let rel = SafeRelPath::parse(name)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    Ok((LocalStore::new(dir), rel))
 }
 
-/// Keep only the newest [`KEEP`] readable lines, if there are more.
-fn trim_at(path: &Path) -> io::Result<()> {
-    let text = String::from_utf8_lossy(&fs::read(path)?).into_owned();
+fn history_rel() -> SafeRelPath {
+    SafeRelPath::parse(HISTORY_FILE).expect("the history name is a safe name")
+}
+
+/// How many times an append starts again when the file changed under it.
+const TRIES: usize = 5;
+
+/// Add one record at the end of the history file `path`, trimmed to the newest [`KEEP`] when it
+/// is over.
+pub fn append_at(path: &Path, record: &SyncRecord) -> io::Result<()> {
+    let (store, rel) = local_of(path)?;
+    append_in(&store, &rel, record)
+}
+
+/// Add one record to the history file `rel` in `store`: read the file, add the line, and write it
+/// back only if it is still as it was read (starting again a few times if not). A file that is
+/// not there is created, never replacing one that turned up. The newest [`KEEP`] readable lines
+/// are kept when the file is over that.
+pub fn append_in(
+    store: &dyn BackupStore,
+    rel: &SafeRelPath,
+    record: &SyncRecord,
+) -> io::Result<()> {
+    let mut line = serde_json::to_string(record).map_err(io::Error::other)?;
+    line.push('\n');
+    let mut last_err = None;
+    for _ in 0..TRIES {
+        let (mut bytes, tag) = match store.read(rel)? {
+            Some((b, t)) => (b, Some(t)),
+            None => (Vec::new(), None),
+        };
+        // A crash may have left the last line without its end: start on a fresh line, or this
+        // record would be glued to the damaged one and lost with it.
+        if bytes.last().is_some_and(|&b| b != b'\n') {
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(line.as_bytes());
+        let bytes = trimmed(bytes);
+        let done = match &tag {
+            Some(t) => store.write_replace(rel, &bytes, Some(t)),
+            None => store.write_new(rel, &bytes),
+        };
+        match done {
+            Ok(_) => return Ok(()),
+            Err(e) if is_conflict(&e) || e.kind() == io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("could not add to the history")))
+}
+
+/// The newest [`KEEP`] readable lines if there are more lines than that (damaged lines go),
+/// else the text as it is.
+fn trimmed(bytes: Vec<u8>) -> Vec<u8> {
+    let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.len() <= KEEP {
-        return Ok(());
+        return bytes;
     }
-    // Damaged lines are dropped by the rewrite; the newest readable ones stay.
     let good: Vec<&str> = lines
         .into_iter()
         .filter(|l| serde_json::from_str::<SyncRecord>(l).is_ok())
@@ -217,17 +249,29 @@ fn trim_at(path: &Path) -> io::Result<()> {
     let keep = &good[good.len().saturating_sub(KEEP)..];
     let mut out = keep.join("\n");
     out.push('\n');
-    crate::state::write_atomic_at(path, out.as_bytes())
+    out.into_bytes()
 }
 
 /// The history in the file `path`, newest first. A line that can't be read is skipped (and
 /// logged); no file is no history.
 pub fn load_at(path: &Path) -> Vec<SyncRecord> {
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
+    match local_of(path) {
+        Ok((store, rel)) => load_in(&store, &rel),
         Err(e) => {
             warn!("Could not read {}: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
+/// The history in the file `rel` in `store`, newest first. A line that can't be read is skipped
+/// (and logged); no file is no history.
+pub fn load_in(store: &dyn BackupStore, rel: &SafeRelPath) -> Vec<SyncRecord> {
+    let bytes = match store.read(rel) {
+        Ok(Some((b, _))) => b,
+        Ok(None) => return Vec::new(),
+        Err(e) => {
+            warn!("Could not read {rel} in {}: {e}", store.describe());
             return Vec::new();
         }
     };
@@ -246,8 +290,8 @@ pub fn load_at(path: &Path) -> Vec<SyncRecord> {
         .collect();
     if skipped > 0 {
         warn!(
-            "{skipped} damaged line(s) in {} were skipped",
-            path.display()
+            "{skipped} damaged line(s) in {rel} in {} were skipped",
+            store.describe()
         );
     }
     if records.len() > KEEP {
@@ -262,15 +306,25 @@ pub fn load_at(path: &Path) -> Vec<SyncRecord> {
 /// [`KEEP`]. `to` is replaced in one step and `from` is not touched, so doing it again changes
 /// nothing. No `from` is nothing to do. Returns whether `to` was written.
 pub fn merge_into(from: &Path, to: &Path) -> io::Result<bool> {
-    let read = |p: &Path| match fs::read(p) {
-        Ok(b) => Ok(Some(String::from_utf8_lossy(&b).into_owned())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    let (store, rel) = local_of(to)?;
+    merge_file_into(from, &store, &rel)
+}
+
+/// [`merge_into`] with the history file of a backup folder held in `store` as the target.
+pub fn merge_from_file(from: &Path, store: &dyn BackupStore) -> io::Result<bool> {
+    merge_file_into(from, store, &history_rel())
+}
+
+fn merge_file_into(from: &Path, store: &dyn BackupStore, rel: &SafeRelPath) -> io::Result<bool> {
+    let from_text = match fs::read(from) {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
     };
-    let Some(from_text) = read(from)? else {
-        return Ok(false);
+    let (to_text, tag) = match store.read(rel)? {
+        Some((b, t)) => (Some(String::from_utf8_lossy(&b).into_owned()), Some(t)),
+        None => (None, None),
     };
-    let to_text = read(to)?;
     let mut seen = std::collections::HashSet::new();
     let mut lines: Vec<(String, String)> = Vec::new();
     for line in to_text
@@ -297,7 +351,10 @@ pub fn merge_into(from: &Path, to: &Path) -> io::Result<bool> {
     if to_text.as_deref() == Some(out.as_str()) {
         return Ok(false);
     }
-    crate::state::write_atomic_at(to, out.as_bytes())?;
+    match tag {
+        Some(t) => store.write_replace(rel, out.as_bytes(), Some(&t))?,
+        None => store.write_new(rel, out.as_bytes())?,
+    };
     Ok(true)
 }
 
@@ -314,6 +371,9 @@ fn is_reserved_name(stem: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::mem::MemStore;
+    use std::fs::OpenOptions;
+    use std::io::Write;
 
     fn history() -> (tempfile::TempDir, History) {
         let t = tempfile::tempdir().unwrap();
@@ -481,5 +541,160 @@ mod tests {
             h.file_of(uuid).file_name().unwrap().to_string_lossy(),
             format!("{uuid}.jsonl")
         );
+    }
+
+    fn hrel() -> SafeRelPath {
+        SafeRelPath::parse(HISTORY_FILE).unwrap()
+    }
+
+    fn line(n: u64) -> String {
+        format!("{}\n", serde_json::to_string(&rec(n)).unwrap())
+    }
+
+    #[test]
+    fn on_a_store_a_record_is_added_and_the_newest_come_first() {
+        let store = MemStore::new();
+        for n in 1..=3 {
+            append_in(&store, &hrel(), &rec(n)).unwrap();
+        }
+        let copied: Vec<u64> = load_in(&store, &hrel()).iter().map(|r| r.copied).collect();
+        assert_eq!(copied, [3, 2, 1]);
+        assert_eq!(store.keys(), [HISTORY_FILE]);
+    }
+
+    /// A store that lets another writer add a line right after the append's first read.
+    struct Racing<'a> {
+        inner: &'a MemStore,
+        done: std::sync::atomic::AtomicBool,
+    }
+
+    // Only the calls the history makes matter; the rest pass straight through.
+    impl BackupStore for Racing<'_> {
+        fn list(&self, p: &dyn Fn(&str) -> bool) -> io::Result<crate::store::Listing> {
+            self.inner.list(p)
+        }
+        fn stat(&self, r: &SafeRelPath) -> io::Result<Option<crate::store::Stat>> {
+            self.inner.stat(r)
+        }
+        fn read(&self, r: &SafeRelPath) -> io::Result<Option<(Vec<u8>, crate::store::Tag)>> {
+            let got = self.inner.read(r);
+            if !self.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let (mut b, _) = self.inner.read(r).unwrap().unwrap();
+                b.extend_from_slice(line(2).as_bytes());
+                self.inner.insert(HISTORY_FILE, &b, None);
+            }
+            got
+        }
+        fn write_new(&self, r: &SafeRelPath, b: &[u8]) -> io::Result<crate::store::Tag> {
+            self.inner.write_new(r, b)
+        }
+        fn write_replace(
+            &self,
+            r: &SafeRelPath,
+            b: &[u8],
+            e: Option<&crate::store::Tag>,
+        ) -> io::Result<crate::store::Tag> {
+            self.inner.write_replace(r, b, e)
+        }
+        fn begin_upload(
+            &self,
+            r: &SafeRelPath,
+            s: u64,
+            m: Option<std::time::SystemTime>,
+        ) -> io::Result<Box<dyn crate::store::Upload>> {
+            self.inner.begin_upload(r, s, m)
+        }
+        fn abort_by_ref(&self, j: &str) -> io::Result<()> {
+            self.inner.abort_by_ref(j)
+        }
+        fn move_no_replace(&self, f: &SafeRelPath, t: &SafeRelPath) -> io::Result<()> {
+            self.inner.move_no_replace(f, t)
+        }
+        fn send_to_bin(&self, r: &SafeRelPath) -> io::Result<()> {
+            self.inner.send_to_bin(r)
+        }
+        fn supports_bin(&self) -> bool {
+            false
+        }
+        fn space(&self) -> Option<crate::platform::DiskSpace> {
+            None
+        }
+        fn root_exists(&self) -> io::Result<bool> {
+            Ok(true)
+        }
+        fn ensure_root(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn describe(&self) -> String {
+            "racing".into()
+        }
+    }
+
+    #[test]
+    fn an_append_that_loses_a_race_reads_again_and_keeps_both_lines() {
+        let store = MemStore::new();
+        append_in(&store, &hrel(), &rec(1)).unwrap();
+        let racing = Racing {
+            inner: &store,
+            done: std::sync::atomic::AtomicBool::new(false),
+        };
+        append_in(&racing, &hrel(), &rec(3)).unwrap();
+        let copied: Vec<u64> = load_in(&store, &hrel()).iter().map(|r| r.copied).collect();
+        assert_eq!(copied, [3, 2, 1], "nothing lost");
+        // One write that conflicted, then the one that went through.
+        assert_eq!(store.calls("write_replace"), 2);
+    }
+
+    #[test]
+    fn an_append_that_fails_for_another_reason_is_not_retried() {
+        let store = MemStore::new();
+        append_in(&store, &hrel(), &rec(1)).unwrap();
+        store.fail_nth("write_replace", 1, io::ErrorKind::PermissionDenied);
+        assert!(append_in(&store, &hrel(), &rec(2)).is_err());
+        assert_eq!(store.calls("write_replace"), 1, "tried once, not again");
+    }
+
+    #[test]
+    fn a_first_append_that_finds_a_file_has_turned_up_adds_to_it() {
+        let store = MemStore::new();
+        // The create is refused as if the file had just appeared; the append reads again.
+        store.fail_nth("write_new", 1, io::ErrorKind::AlreadyExists);
+        store.insert(HISTORY_FILE, line(1).as_bytes(), None);
+        append_in(&store, &hrel(), &rec(2)).unwrap();
+        assert_eq!(load_in(&store, &hrel()).len(), 2);
+        // And with no file the create is refused once, then the retry creates it.
+        let fresh = MemStore::new();
+        fresh.fail_nth("write_new", 1, io::ErrorKind::AlreadyExists);
+        append_in(&fresh, &hrel(), &rec(1)).unwrap();
+        assert_eq!(load_in(&fresh, &hrel()).len(), 1);
+    }
+
+    #[test]
+    fn on_a_store_a_damaged_line_is_skipped_and_the_cap_holds() {
+        let store = MemStore::new();
+        let cut = "{\"started\":\"2026-01-01T00:00:00Z\",\"copied\":9}";
+        store.insert(HISTORY_FILE, format!("junk\n{cut}").as_bytes(), None);
+        append_in(&store, &hrel(), &rec(1)).unwrap();
+        let copied: Vec<u64> = load_in(&store, &hrel()).iter().map(|r| r.copied).collect();
+        assert_eq!(copied, [1, 9], "the new line got its own line");
+        for n in 2..=(KEEP as u64 + 3) {
+            append_in(&store, &hrel(), &rec(n)).unwrap();
+        }
+        let text = String::from_utf8(store.get(HISTORY_FILE).unwrap()).unwrap();
+        assert_eq!(text.lines().count(), KEEP);
+        assert!(!text.contains("junk"));
+    }
+
+    #[test]
+    fn a_merge_into_a_store_is_written_once() {
+        let t = tempfile::tempdir().unwrap();
+        let from = t.path().join("from.jsonl");
+        fs::write(&from, (1..=3).map(line).collect::<String>()).unwrap();
+        let store = MemStore::new();
+        append_in(&store, &hrel(), &rec(2)).unwrap();
+        assert!(merge_from_file(&from, &store).unwrap());
+        assert!(!merge_from_file(&from, &store).unwrap());
+        let copied: Vec<u64> = load_in(&store, &hrel()).iter().map(|r| r.copied).collect();
+        assert_eq!(copied, [3, 2, 1]);
     }
 }

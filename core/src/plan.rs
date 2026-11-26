@@ -7,6 +7,7 @@
 //! archive folder's name and layout, how storages are laid out, and which comparison to use.
 #![forbid(unsafe_code)]
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use log::{debug, info, warn};
-use walkdir::WalkDir;
 
 use crate::counted;
 use crate::device::{
@@ -26,6 +26,7 @@ use crate::owner::{self, OwnerState};
 use crate::paths::SafeRelPath;
 use crate::registry::{ArchiveLayout, DeletedFiles, DeviceSettings, FileTypes, StorageLayout};
 use crate::signals::{Signals, View};
+use crate::store::{BackupStore, Kind, LocalStore, mtimes};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanProgress {
@@ -53,14 +54,46 @@ pub fn scan(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(ScanProgress),
 ) -> Result<(ScanPlan, Summary), DeviceError> {
+    scan_in(
+        source,
+        &LocalStore::new(root),
+        root,
+        skip,
+        opts,
+        cancel,
+        progress,
+    )
+}
+
+/// [`scan`] against any [`BackupStore`]. `root` is the backup's folder path for a folder store (it
+/// is checked against the device's own folder: a backup inside the device, or the device inside
+/// the backup, is refused), and only a label for the plan (`s3://bucket/prefix`) for any other.
+/// The owner marker and the made list are read from the store.
+///
+/// Where the store has no modified times in its listing (an object store) and the device's files
+/// are compared by date, a file whose name and size match is looked at once with
+/// [`BackupStore::stat`] for its modified time; one that has none is matched by name and size.
+/// [`ScanPlan::mtime_lookups`] says how many such lookups there were. A store that can't be
+/// reached stops the scan with a message rather than showing everything as new.
+pub fn scan_in(
+    source: &mut dyn DeviceSource,
+    store: &dyn BackupStore,
+    root: &Path,
+    skip: &HashSet<String>,
+    opts: &ScanOptions,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(ScanProgress),
+) -> Result<(ScanPlan, Summary), DeviceError> {
     let started = Instant::now();
     owner::validate_archive_name(&opts.settings.archive_name).map_err(DeviceError::Failed)?;
-    refuse_dot_dot(root)?;
-    refuse_overlap(source.local_root(), root)?;
+    if store.as_local().is_some() {
+        refuse_dot_dot(root)?;
+        refuse_overlap(source.local_root(), root)?;
+    }
     info!(
         "Scan started: {} against the backup folder {} ({} on the skip list)",
         source.identity().label(),
-        root.display(),
+        store.describe(),
         skip.len()
     );
     let enumeration = source.enumerate(cancel, &mut |files, folder| {
@@ -76,14 +109,17 @@ pub fn scan(
         counted(enumeration.incomplete.len(), "folder", "folders"),
         started.elapsed().as_secs_f64()
     );
-    let index = index_backup(
-        root,
+    let index = index_backup_in(
+        store,
         &opts.settings.archive_name,
         &opts.settings.ignore_names,
         cancel,
         &mut |files| progress(ScanProgress::Backup { files }),
     )
-    .map_err(|Cancelled| DeviceError::Cancelled)?;
+    .map_err(|stop| match stop {
+        IndexStop::Cancelled => DeviceError::Cancelled,
+        IndexStop::Failed(why) => DeviceError::Failed(why),
+    })?;
     info!(
         "Indexed the backup folder: {}, {}",
         counted(index.len(), "file", "files"),
@@ -92,8 +128,48 @@ pub fn scan(
     progress(ScanProgress::Comparing {
         files: enumeration.files.len(),
     });
-    let made = MadeList::load_readonly(root);
-    let plan = build_plan(
+    let made = MadeList::load_readonly_in(store);
+    let remote = store.as_local().is_none();
+    let lookups = Cell::new(0usize);
+    let lookup_failed: RefCell<Option<std::io::Error>> = RefCell::new(None);
+    // The modified-time cache (object stores only): one read. An entry counts only when its size
+    // and tag match the listing; anything else is looked at with a stat.
+    let cache = remote.then(|| mtimes::load(store));
+    let found: RefCell<Vec<(String, mtimes::Entry)>> = RefCell::new(Vec::new());
+    let stat_mtime = |have: &IndexedFile, device: SystemTime| -> Option<SystemTime> {
+        if lookup_failed.borrow().is_some() {
+            return None;
+        }
+        if let Some(c) = &cache
+            && let Some(t) = c.lookup(&have.path, have.size, have.tag.as_deref())
+        {
+            return Some(t);
+        }
+        lookups.set(lookups.get() + 1);
+        let rel = SafeRelPath::parse(&have.path).ok()?;
+        match store.stat(&rel) {
+            Ok(found_stat) => {
+                let mtime = found_stat.and_then(|s| s.mtime);
+                // A file with no recorded time (put there by another tool) is taken as the
+                // device's: it matches by name and size, and the cache keeps the device's time.
+                let keep = mtime.unwrap_or(device);
+                if let Some(tag) = &have.tag {
+                    found
+                        .borrow_mut()
+                        .push((have.path.clone(), mtimes::Entry::new(have.size, tag, keep)));
+                }
+                mtime
+            }
+            Err(e) => {
+                *lookup_failed.borrow_mut() = Some(e);
+                None
+            }
+        }
+    };
+    #[allow(clippy::type_complexity)]
+    let resolver: Option<&dyn Fn(&IndexedFile, SystemTime) -> Option<SystemTime>> =
+        remote.then_some(&stat_mtime);
+    let mut plan = build_plan_with(
         source.identity(),
         root,
         enumeration,
@@ -101,7 +177,25 @@ pub fn scan(
         &made,
         skip,
         opts,
+        resolver,
     );
+    if let Some(e) = lookup_failed.take() {
+        warn!("Scan stopped: could not look at a backup file: {e}");
+        return Err(DeviceError::Failed(crate::store::explain(&e)));
+    }
+    plan.mtime_lookups = lookups.get();
+    if let Some(c) = cache {
+        plan.mtime_cache = Some(c.carried(index.files(), found.take()));
+    }
+    if remote {
+        // Not a folder: nothing to resolve, and the label is the plan's name for it.
+        plan.root = root.to_path_buf();
+        plan.root_canonical = None;
+        info!(
+            "Looked up the modified time of {} in the backup",
+            counted(plan.mtime_lookups, "file", "files")
+        );
+    }
     let summary = plan.summary(index.len());
     let s = &summary;
     info!(
@@ -123,7 +217,7 @@ pub fn scan(
 /// The path as the file system names it. A folder that doesn't exist yet is resolved through its
 /// nearest existing parent, so a backup folder not yet made is still compared properly. On
 /// Windows the letter case is dropped, since names there differ only by case at most.
-fn comparable(path: &Path) -> PathBuf {
+pub(crate) fn comparable(path: &Path) -> PathBuf {
     let mut rest = Vec::new();
     let mut at = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let mut resolved = loop {
@@ -213,6 +307,8 @@ pub struct IndexedFile {
     pub path: String,
     /// The file's modified time on this computer, if it reports one.
     pub modified: Option<SystemTime>,
+    /// The store's version tag for the file (the ETag on an object store), where it has one.
+    pub tag: Option<String>,
 }
 
 /// The files already in the backup folder, keyed case-insensitively (as NTFS compares names).
@@ -245,6 +341,15 @@ impl BackupIndex {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cancelled;
 
+/// Why indexing a store stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexStop {
+    Cancelled,
+    /// A store that is not a folder could not be read (no network, no access, ...). The message
+    /// is for the user. A folder that can't be read is reported as an issue instead.
+    Failed(String),
+}
+
 /// Whether `name` is on a list of names, ignoring case.
 fn listed(list: &[String], name: &str) -> bool {
     list.iter().any(|n| n.eq_ignore_ascii_case(name))
@@ -261,15 +366,46 @@ pub fn index_backup(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
 ) -> Result<BackupIndex, Cancelled> {
+    index_backup_in(
+        &LocalStore::new(root),
+        archive_name,
+        ignore,
+        cancel,
+        progress,
+    )
+    .map_err(|_| Cancelled)
+}
+
+/// [`index_backup`] over a [`BackupStore`]; the owner marker is read from the store.
+pub fn index_backup_in(
+    store: &dyn BackupStore,
+    archive_name: &str,
+    ignore: &[String],
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(usize),
+) -> Result<BackupIndex, IndexStop> {
     let mut index = BackupIndex::default();
-    if !root.exists() {
-        info!(
-            "The backup folder {} doesn't exist yet: every file counts as new",
-            root.display()
-        );
-        return Ok(index);
+    let remote = store.as_local().is_none();
+    match store.root_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            info!(
+                "The backup folder {} doesn't exist yet: every file counts as new",
+                store.describe()
+            );
+            return Ok(index);
+        }
+        Err(e) if remote => return Err(IndexStop::Failed(crate::store::explain(&e))),
+        Err(e) => {
+            report(
+                &mut index.issues,
+                store.describe(),
+                format!("could not check that the backup folder is there: {e}"),
+            );
+            return Ok(index);
+        }
     }
-    index.owner = owner::read(root);
+    index.owner = owner::read_in(store);
     match &index.owner {
         OwnerState::Unclaimed => info!("The backup folder has no owner yet ({})", owner::MARKER),
         OwnerState::Owned(o) => info!("The backup folder belongs to {}", o.device_name),
@@ -281,95 +417,122 @@ pub fn index_backup(
     // The app's own entries are left out: the owner marker at the top, and archive folders at
     // any depth (an archive is never "backup files deleted from the device").
     let archives = owner::archive_names(&index.owner, archive_name);
-    let mut walk = WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            let top_level_app_entry = e.depth() == 1 && is_app_entry(&name, &archives);
-            let archive = e.depth() >= 1
-                && e.file_type().is_dir()
-                && archives.iter().any(|a| name.eq_ignore_ascii_case(a));
-            !(top_level_app_entry || archive)
-        });
-    while let Some(entry) = walk.next() {
+    let stopped = Cell::new(false);
+    let prune = |folder: &str| {
         if cancel.load(Ordering::Relaxed) {
-            return Err(Cancelled);
+            stopped.set(true);
+            return true;
         }
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                let at = e.path().map(|p| shown(root, p)).unwrap_or_default();
+        let name = folder.rsplit('/').next().unwrap_or(folder);
+        let top_level_app_entry = !folder.contains('/') && is_app_entry(name, &archives);
+        let archive = archives.iter().any(|a| name.eq_ignore_ascii_case(a));
+        top_level_app_entry || archive
+    };
+    let listing = match store.list(&prune) {
+        Ok(l) => l,
+        Err(e) if remote => return Err(IndexStop::Failed(crate::store::explain(&e))),
+        Err(e) => {
+            report(
+                &mut index.issues,
+                store.describe(),
+                format!("could not list the backup folder: {e}"),
+            );
+            return Ok(index);
+        }
+    };
+    if stopped.get() || cancel.load(Ordering::Relaxed) {
+        return Err(IndexStop::Cancelled);
+    }
+    // A folder with its own owner marker is another backup folder, perhaps another phone's: none
+    // of it is this backup's, so it is never compared, copied over or archived. Found by the
+    // marker in the listing; a folder inside another such folder is part of it.
+    let is_marker = |name: &str| {
+        if cfg!(windows) {
+            name.eq_ignore_ascii_case(owner::MARKER)
+        } else {
+            name == owner::MARKER
+        }
+    };
+    let mut foreign: Vec<String> = listing
+        .files
+        .iter()
+        .filter_map(|f| f.rel.rsplit_once('/'))
+        .filter(|(_, name)| is_marker(name))
+        .map(|(dir, _)| dir.to_string())
+        .collect();
+    foreign.sort();
+    let foreign: Vec<String> = foreign
+        .iter()
+        .filter(|d| {
+            !foreign
+                .iter()
+                .any(|o| o != *d && d.starts_with(&format!("{o}/")))
+        })
+        .cloned()
+        .collect();
+    let in_foreign = |rel: &str| {
+        foreign
+            .iter()
+            .any(|d| rel == d || rel.starts_with(&format!("{d}/")))
+    };
+    for dir in &foreign {
+        index.issues.push(ScanIssue::new(
+            dir.clone(),
+            "another backup folder (it has its own owner marker); left alone",
+        ));
+    }
+    for issue in &listing.issues {
+        if !in_foreign(&issue.at) {
+            report(&mut index.issues, issue.at.clone(), issue.why.clone());
+        }
+    }
+    for f in &listing.files {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(IndexStop::Cancelled);
+        }
+        let rel = &f.rel;
+        if in_foreign(rel) {
+            continue;
+        }
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        // The app's own files at the top.
+        if !rel.contains('/') && is_app_entry(name, &archives) {
+            continue;
+        }
+        match f.kind {
+            Kind::Link => {
                 report(
                     &mut index.issues,
-                    at,
-                    format!("could not read this in the backup folder: {e}"),
+                    rel,
+                    "link or junction in the backup folder; not followed",
                 );
                 continue;
             }
-        };
-        let ft = entry.file_type();
-        // A folder with its own owner marker is another backup folder, perhaps another
-        // phone's: none of it is this backup's, so it is never compared, copied over or archived.
-        if ft.is_dir() && entry.depth() >= 1 && entry.path().join(owner::MARKER).exists() {
-            index.issues.push(ScanIssue::new(
-                shown(root, entry.path()),
-                "another backup folder (it has its own owner marker); left alone",
-            ));
-            walk.skip_current_dir();
-            continue;
-        }
-        if ft.is_symlink() {
-            report(
-                &mut index.issues,
-                shown(root, entry.path()),
-                "link or junction in the backup folder; not followed",
-            );
-            continue;
-        }
-        if !ft.is_file() {
-            continue;
+            Kind::Other => continue,
+            Kind::File => {}
         }
         // PC clutter is never indexed, so it is never compared or archived.
-        if listed(ignore, &entry.file_name().to_string_lossy()) {
-            debug!("Ignored (PC clutter): {}", shown(root, entry.path()));
+        if listed(ignore, name) {
+            debug!("Ignored (PC clutter): {rel}");
             continue;
         }
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        let Some(rel) = rel.to_str() else {
+        if crate::paths::is_temp_name(rel) {
             report(
                 &mut index.issues,
-                shown(root, entry.path()),
-                "name in the backup folder is not valid Unicode; ignored",
-            );
-            continue;
-        };
-        let rel = rel.replace('\\', "/");
-        if crate::paths::is_temp_name(&rel) {
-            report(
-                &mut index.issues,
-                &rel,
+                rel,
                 "unfinished copy left by an earlier run (safe to delete)",
             );
             continue;
         }
-        match entry.metadata() {
-            Ok(m) => {
-                let file = IndexedFile {
-                    size: m.len(),
-                    path: rel.clone(),
-                    modified: m.modified().ok(),
-                };
-                index.files.insert(rel.to_lowercase(), file);
-            }
-            Err(e) => report(
-                &mut index.issues,
-                &rel,
-                format!("could not read this backup file's size: {e}"),
-            ),
-        }
+        index.files.insert(
+            rel.to_lowercase(),
+            IndexedFile {
+                size: f.size,
+                path: rel.clone(),
+                modified: f.mtime,
+                tag: f.tag.clone(),
+            },
+        );
         if index.files.len() % 200 == 0 {
             progress(index.files.len());
         }
@@ -672,6 +835,12 @@ pub struct ScanPlan {
     pub storage_folders: Vec<String>,
     /// The JPG copies of HEIC photos this sync would make ([`JpgPlan`]).
     pub jpg: JpgPlan,
+    /// How many backup files the scan asked the store for a modified time (a store whose listing
+    /// has none), because the device's files are compared by date.
+    pub mtime_lookups: usize,
+    /// The modified-time cache as this scan leaves it (object stores only): the entries that
+    /// still match the listing, plus what the scan looked up. A sync adds its uploads and saves it.
+    pub mtime_cache: Option<mtimes::Snapshot>,
 }
 
 /// A backup file whose device file is gone: no device file has its path.
@@ -729,14 +898,6 @@ impl ScanPlan {
             }
         }
         s
-    }
-}
-
-/// A backup-folder path as shown in the Problems list: relative to the backup folder, with `/`.
-fn shown(root: &Path, path: &Path) -> String {
-    match path.strip_prefix(root) {
-        Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().replace('\\', "/"),
-        _ => path.display().to_string(),
     }
 }
 
@@ -944,6 +1105,24 @@ pub fn build_plan(
     skip: &HashSet<String>,
     opts: &ScanOptions,
 ) -> ScanPlan {
+    build_plan_with(identity, root, enumeration, index, made, skip, opts, None)
+}
+
+/// [`build_plan`], with `modified_of` for a store whose listing has no modified times: asked for
+/// a backup file that matches in name and size when files are compared by date and the device
+/// has a date for it. `None` from it means the store has no date for the file, and the file is
+/// then matched by name and size alone.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn build_plan_with(
+    identity: &DeviceIdentity,
+    root: &Path,
+    enumeration: Enumeration,
+    index: &BackupIndex,
+    made: &MadeList,
+    skip: &HashSet<String>,
+    opts: &ScanOptions,
+    modified_of: Option<&dyn Fn(&IndexedFile, SystemTime) -> Option<SystemTime>>,
+) -> ScanPlan {
     let settings = &opts.settings;
     let root_abs = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     let Enumeration {
@@ -1060,7 +1239,16 @@ pub fn build_plan(
             ),
             (None, Some(_)) => Status::New,
             (Some(have), Some(size)) => {
-                if is_backed_up(size, file.modified, have, settings.compare_by_date) {
+                let mut have = have.clone();
+                if let Some(modified_of) = modified_of
+                    && settings.compare_by_date
+                    && let Some(device) = file.modified
+                    && have.modified.is_none()
+                    && have.size == size
+                {
+                    have.modified = modified_of(&have, device);
+                }
+                if is_backed_up(size, file.modified, &have, settings.compare_by_date) {
                     Status::Verified
                 } else if size == 0 && have.size > 0 {
                     // A file that shrank to nothing is more likely a placeholder than a real
@@ -1214,6 +1402,8 @@ pub fn build_plan(
         storage_choice,
         storage_folders,
         jpg,
+        mtime_lookups: 0,
+        mtime_cache: None,
     }
 }
 
@@ -1597,6 +1787,7 @@ mod tests {
             size,
             path: "a".into(),
             modified,
+            tag: None,
         }
     }
 

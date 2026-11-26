@@ -33,6 +33,41 @@ folder:
 cargo run --features plug-n-keep/fake-device -- --fake-device <folder> --state-dir <folder>
 ```
 
+`--state-dir <folder>` works in release builds too. Local mode keeps its settings in that folder
+and S3 mode in the `s3` folder inside it. The `--fake-*` options are for debug builds with the
+`fake-device` feature only.
+
+### S3 tests
+
+Tests of the S3 backup destination run against pretend servers by default. The ones that need a real
+server are skipped unless `PNK_S3_TEST=1`:
+
+```text
+PNK_S3_TEST=1 PNK_S3_ENDPOINT=http://localhost:9000 PNK_S3_PROFILE=pnk-test AWS_SHARED_CREDENTIALS_FILE=<credentials file> cargo test --workspace
+```
+
+- `PNK_S3_ENDPOINT` is the server's address (path-style addressing is used). `PNK_S3_BUCKET` and
+  `PNK_S3_PROFILE` both default to `pnk-test`; the profile is read from the credentials file named
+  by `AWS_SHARED_CREDENTIALS_FILE`, as in [README.md](README.md#backing-up-to-an-s3-bucket).
+- Each test works under its own random `itest/<random>/` prefix and removes what it made. The
+  cleanup, and the tests, only ever touch a bucket named `pnk-test`, and only under `itest/`.
+- The server must support conditional writes (`If-None-Match`, `If-Match`), or the app's own
+  self-test refuses it ([DESIGN.md](DESIGN.md#113-checks)).
+- The cleanup is also used by the app's tests, through `pnk-core`'s `test-support` feature. It is a
+  dev-dependency of the app only and is never enabled in a build.
+
+Any S3-compatible server that does conditional writes will do. For example, RustFS or MinIO can be
+run locally with a data folder, an access key and a secret key you choose, and a bucket named
+`pnk-test` made with any S3 client. Put the keys in a credentials file under a `[pnk-test]` profile:
+
+```text
+[pnk-test]
+aws_access_key_id = <access key>
+aws_secret_access_key = <secret key>
+```
+
+Use a throwaway server and bucket, not one that holds anything you want to keep.
+
 ## Releases
 
 Pushing a tag `vX.Y.Z` builds the Windows and Linux downloads and publishes them as a GitHub

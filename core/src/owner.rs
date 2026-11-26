@@ -3,16 +3,17 @@
 //! so pointing a second phone at the folder by mistake can't archive the first phone's photos.
 #![forbid(unsafe_code)]
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::Path;
 
 use log::info;
 use serde::{Deserialize, Serialize};
 
-use crate::paths::is_link;
+use crate::paths::SafeRelPath;
 use crate::plan::ARCHIVE_DIR;
 use crate::signals::{Signals, View};
+use crate::store::{BackupStore, Kind, LocalStore};
 
 /// The marker file, in the top of the backup folder.
 pub const MARKER: &str = ".plug-n-keep.json";
@@ -109,19 +110,29 @@ pub enum OwnerState {
     Unreadable(String),
 }
 
+fn marker_rel() -> SafeRelPath {
+    SafeRelPath::parse(MARKER).expect("the marker name is a safe name")
+}
+
 /// Read the marker in `root`. A link or folder in its place counts as unreadable.
 pub fn read(root: &Path) -> OwnerState {
-    let path = root.join(MARKER);
-    match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return OwnerState::Unclaimed,
+    read_in(&LocalStore::new(root))
+}
+
+/// Read the marker in `store`. A link or folder in its place counts as unreadable.
+pub fn read_in(store: &dyn BackupStore) -> OwnerState {
+    let rel = marker_rel();
+    match store.stat(&rel) {
+        Ok(None) => return OwnerState::Unclaimed,
         Err(e) => return OwnerState::Unreadable(e.to_string()),
-        Ok(m) if is_link(&m) || !m.is_file() => {
+        Ok(Some(s)) if s.kind != Kind::File => {
             return OwnerState::Unreadable("it is not a plain file".into());
         }
-        Ok(_) => {}
+        Ok(Some(_)) => {}
     }
-    match fs::read_to_string(&path) {
-        Ok(text) => match serde_json::from_str(&text) {
+    match store.read(&rel) {
+        Ok(None) => OwnerState::Unclaimed,
+        Ok(Some((bytes, _))) => match serde_json::from_slice(&bytes) {
             Ok(owner) => OwnerState::Owned(Box::new(owner)),
             Err(e) => OwnerState::Unreadable(e.to_string()),
         },
@@ -132,34 +143,38 @@ pub fn read(root: &Path) -> OwnerState {
 /// Write the marker into `root_canon`, the canonical backup folder, replacing any marker
 /// in one step.
 pub fn write(root_canon: &Path, owner: &FolderOwner) -> io::Result<()> {
-    write_marker(root_canon, owner, true)
+    write_in(&LocalStore::new(root_canon), owner)
 }
 
 /// Write a first marker into `root_canon`: if one has turned up since it was last read, it is
 /// not replaced (`AlreadyExists`).
 pub fn write_new(root_canon: &Path, owner: &FolderOwner) -> io::Result<()> {
-    write_marker(root_canon, owner, false)
+    write_new_in(&LocalStore::new(root_canon), owner)
 }
 
-fn write_marker(root_canon: &Path, owner: &FolderOwner, replace: bool) -> io::Result<()> {
-    let tmp = root_canon.join(format!("{MARKER}.tmp"));
-    let _ = fs::remove_file(&tmp); // a stale one from a crash
-    {
-        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        f.write_all(&serde_json::to_vec_pretty(owner).map_err(io::Error::other)?)?;
-        crate::platform::flush_file(&f)?;
-    }
-    let to = root_canon.join(MARKER);
+/// Write the marker into `store`, replacing any marker in one step.
+pub fn write_in(store: &dyn BackupStore, owner: &FolderOwner) -> io::Result<()> {
+    write_marker(store, owner, true)
+}
+
+/// Write a first marker into `store`: if one has turned up since it was last read, it is not
+/// replaced (`AlreadyExists`).
+pub fn write_new_in(store: &dyn BackupStore, owner: &FolderOwner) -> io::Result<()> {
+    write_marker(store, owner, false)
+}
+
+fn write_marker(store: &dyn BackupStore, owner: &FolderOwner, replace: bool) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(owner).map_err(io::Error::other)?;
+    let rel = marker_rel();
     if replace {
-        crate::platform::rename_replace(&tmp, &to)?;
-    } else if let Err(e) = crate::platform::rename_no_replace(&tmp, &to) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
+        store.write_replace(&rel, &bytes, None)?;
+    } else {
+        store.write_new(&rel, &bytes)?;
     }
     info!(
         "Recorded {} as the owner of the backup folder {} ({MARKER})",
         owner.device_name,
-        root_canon.display()
+        store.describe()
     );
     Ok(())
 }
@@ -218,9 +233,30 @@ pub fn hand_over(
 ) -> Result<(), String> {
     let root = fs::canonicalize(root)
         .map_err(|e| format!("Could not find the backup folder {}: {e}", root.display()))?;
+    hand_over_in(
+        &LocalStore::new(root),
+        device_id,
+        device_name,
+        signals,
+        view,
+        archive_name,
+        now,
+    )
+}
+
+/// [`hand_over`] on a store.
+pub fn hand_over_in(
+    store: &dyn BackupStore,
+    device_id: &str,
+    device_name: &str,
+    signals: Signals,
+    view: View,
+    archive_name: &str,
+    now: &str,
+) -> Result<(), String> {
     let mut marker = FolderOwner::new(device_id, device_name, signals, view, now)
         .with_archive_name(archive_name);
-    match read(&root) {
+    match read_in(store) {
         OwnerState::Owned(old) => {
             if let Some(why) = view_conflict(&old, view) {
                 return Err(format!("Not handed over: {why}."));
@@ -237,12 +273,12 @@ pub fn hand_over(
             }
         }
         OwnerState::Unclaimed => {
-            return write_new(&root, &marker)
+            return write_new_in(store, &marker)
                 .map_err(|e| format!("Could not record the folder's owner: {e}"));
         }
         OwnerState::Unreadable(_) => {}
     }
-    write(&root, &marker).map_err(|e| format!("Could not record the folder's owner: {e}"))
+    write_in(store, &marker).map_err(|e| format!("Could not record the folder's owner: {e}"))
 }
 
 /// The names that are the app's own in a backup folder, never backup content: every archive
@@ -274,8 +310,9 @@ pub fn validate_archive_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The marker, the device record, the sync history, the skip list, the list of made JPG copies and their
-/// temporary or set-aside files: app files, not backup files.
+/// The marker, the device record, the sync history, the skip list, the list of made JPG copies,
+/// the probe object an S3 store writes to check the server, and their temporary or set-aside
+/// files: app files, not backup files.
 pub fn is_marker_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     [
@@ -284,6 +321,9 @@ pub fn is_marker_name(name: &str) -> bool {
         crate::folder_record::DEVICE_FILE,
         crate::folder_record::HISTORY_FILE,
         crate::state::SKIP_NAME,
+        crate::store::mtimes::NAME,
+        crate::store::s3::PROBE_PREFIX,
+        crate::bucket_settings::SETTINGS_FILE,
     ]
     .iter()
     .any(|n| lower.starts_with(n))
@@ -480,5 +520,84 @@ mod tests {
         // A hand-over into a folder where a marker has turned up is a replacement, and is
         // checked on its own.
         write(t.path(), &marker("third", View::Files, &["C"])).unwrap();
+    }
+
+    fn mem_marker_text(store: &crate::store::mem::MemStore) -> String {
+        String::from_utf8(store.get(MARKER).expect("a marker")).unwrap()
+    }
+
+    #[test]
+    fn on_a_store_a_first_claim_is_refused_when_a_marker_exists() {
+        let store = crate::store::mem::MemStore::new();
+        assert_eq!(read_in(&store), OwnerState::Unclaimed);
+        write_new_in(&store, &marker("first", View::Files, &["A"])).unwrap();
+        let before = mem_marker_text(&store);
+        let err = write_new_in(&store, &marker("second", View::Files, &["B"])).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(mem_marker_text(&store), before);
+        let OwnerState::Owned(m) = read_in(&store) else {
+            panic!("no marker")
+        };
+        assert_eq!(m.device_id, "first");
+        // A replacing write is a separate, deliberate act.
+        write_in(&store, &marker("third", View::Files, &["C"])).unwrap();
+        assert!(matches!(read_in(&store), OwnerState::Owned(m) if m.device_id == "third"));
+    }
+
+    #[test]
+    fn a_bad_marker_on_a_store_is_unreadable() {
+        let store = crate::store::mem::MemStore::new();
+        store.insert(MARKER, b"{ not json", None);
+        assert!(matches!(read_in(&store), OwnerState::Unreadable(_)));
+        // An unreadable marker is the one case besides another device's that a hand-over replaces.
+        hand_over_in(
+            &store,
+            "new",
+            "n",
+            Signals::default(),
+            View::Files,
+            "_Archive",
+            "now",
+        )
+        .unwrap();
+        assert!(matches!(read_in(&store), OwnerState::Owned(m) if m.device_id == "new"));
+    }
+
+    #[test]
+    fn a_hand_over_on_a_store_keeps_the_old_names_and_refuses_another_view() {
+        let store = crate::store::mem::MemStore::new();
+        write_in(
+            &store,
+            &marker("old", View::Files, &["Old name", "_Archive"]),
+        )
+        .unwrap();
+        let err = hand_over_in(
+            &store,
+            "new",
+            "n",
+            Signals::default(),
+            View::Afc,
+            "_Archive",
+            "now",
+        )
+        .unwrap_err();
+        assert!(err.contains("afc"), "{err}");
+        assert!(matches!(read_in(&store), OwnerState::Owned(m) if m.device_id == "old"));
+        hand_over_in(
+            &store,
+            "new",
+            "new stick",
+            Signals::default(),
+            View::Files,
+            "Fresh",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        let OwnerState::Owned(m) = read_in(&store) else {
+            panic!("no marker")
+        };
+        assert_eq!(m.device_id, "new");
+        assert_eq!(m.archive_names, ["Old name", "_Archive", "Fresh"]);
+        assert_eq!(m.created, "2025-05-05T00:00:00Z");
     }
 }

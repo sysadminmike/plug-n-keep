@@ -327,7 +327,15 @@ fn the_apps_own_files_are_never_indexed_or_archived() {
         assert!(dir.join(own).is_file(), "{own}");
     }
     // Leftovers of a write in progress are the app's too.
-    fs::write(dir.join(format!("{DEVICE_FILE}.123-0.tmp")), b"x").unwrap();
+    for own in [
+        DEVICE_FILE,
+        HISTORY_FILE,
+        skip_name,
+        owner::MARKER,
+        crate::heic::made::MADE_NAME,
+    ] {
+        fs::write(dir.join(format!("{own}.123-0.tmp")), b"x").unwrap();
+    }
     fs::write(dir.join(format!("{HISTORY_FILE}.damaged")), b"x").unwrap();
     fs::write(dir.join("photo.jpg"), b"p").unwrap();
 
@@ -421,12 +429,10 @@ fn adding_a_backup_of_a_known_device_from_another_folder_is_a_move() {
     let mut reg = Registry::default();
     reg.add(d.clone());
     reg.save(&e.state).unwrap();
-    // The folder copied elsewhere, where its settings were changed on another PC.
+    // The folder moved elsewhere, where its settings were changed on another PC. (A copy with
+    // the original still in place is not clear-cut, and is reported as a problem instead.)
     let copy = e.base.join("copy");
-    fs::create_dir_all(&copy).unwrap();
-    for f in [owner::MARKER, DEVICE_FILE] {
-        fs::copy(old.join(f), copy.join(f)).unwrap();
-    }
+    fs::rename(&old, &copy).unwrap();
     let mut changed = folder_record::read_device(&copy, &d.id).unwrap().unwrap();
     changed.settings.scan_automatically = false;
     folder_record::write_device(&copy, &changed).unwrap();

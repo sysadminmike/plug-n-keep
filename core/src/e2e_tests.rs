@@ -1060,6 +1060,7 @@ fn after_a_crash_the_file_is_copied_again_not_skipped() {
             source: "DCIM/IMG_0001.HEIC".into(),
             temp: temp.clone(),
             replace: None,
+            destination: None,
         })
         .unwrap();
     let rec = e.state.recover_interrupted(&known(&e)).unwrap().unwrap();
@@ -2759,7 +2760,9 @@ fn crash_state(
                 original: o.clone(),
                 archived: a.clone(),
                 goes: crate::state::OldCopyGoes::Archive,
+                staged_size: None,
             }),
+            destination: None,
         })
         .unwrap();
     (o, a, t)
@@ -2832,7 +2835,9 @@ fn recovery_does_not_move_files_outside_the_backup_folder() {
                 original: o.clone(),
                 archived: outside.join("IMG.HEIC"),
                 goes: crate::state::OldCopyGoes::Archive,
+                staged_size: None,
             }),
+            destination: None,
         })
         .unwrap();
     let got = e.state.recover_interrupted(&known(&e)).unwrap().unwrap();
@@ -2853,7 +2858,9 @@ fn record(e: &Env, root: &Path, temp: &Path, step: Option<(&Path, &Path)>) {
                 original: o.to_path_buf(),
                 archived: a.to_path_buf(),
                 goes: crate::state::OldCopyGoes::Archive,
+                staged_size: None,
             }),
+            destination: None,
         })
         .unwrap();
 }
@@ -3815,7 +3822,9 @@ fn write_record(e: &Env, o: &Path, t: &Path, moved: &Path, goes: OldCopyGoes) {
                 original: o.to_path_buf(),
                 archived: moved.to_path_buf(),
                 goes,
+                staged_size: None,
             }),
+            destination: None,
         })
         .unwrap();
 }
@@ -4278,13 +4287,10 @@ const ALLOWED_USES: &[(&str, &[&str], &str)] = &[
     (
         "remove_file",
         &[
-            "core/src/sync.rs",          // the unfinished temp copy of a file being saved
-            "core/src/state.rs",         // the crash record, and a leftover temp it names
-            "core/src/idfile.rs",        // the temp of the ID file it was writing
-            "core/src/history.rs",       // a forgotten device's own history file
-            "core/src/heic/mod.rs",      // its own `.pnk-jpg-part` temp of a JPG copy
-            "core/src/heic/made.rs",     // the temp of the made list it was writing
-            "core/src/owner.rs",         // the temp of the marker it was writing
+            "core/src/store/local.rs",         // an unfinished `.pnk-part` upload
+            "core/src/state.rs",               // the crash record
+            "core/src/idfile.rs",              // the temp of the ID file it was writing
+            "core/src/heic/mod.rs", // its own `.pnk-jpg-part` temp of a JPG copy, and the `plug-n-keep-<pid>-<n>.<ext>` temp of a HEIC read from a device (guard drop, and the start-up sweep of old ones)
             "core/src/platform/unix.rs", // the link-then-unlink move and its undo
             "core/src/platform/unix_trash.rs", // only the `.trashinfo` it has just written
         ],
@@ -4335,10 +4341,6 @@ const ALLOWED_USES: &[(&str, &[&str], &str)] = &[
 /// Files that open a file for writing without `create_new` (which would refuse an existing
 /// file), and why that is not an overwrite of a backup file.
 const OPEN_FOR_WRITE_OK: &[(&str, &str)] = &[
-    (
-        "core/src/history.rs",
-        "appends to the app's own per-device history file",
-    ),
     (
         "core/src/platform/unix.rs",
         "opens an existing file only to flush it to disk",
@@ -4814,3 +4816,4 @@ fn a_file_at_the_temps_name_that_this_copy_did_not_create_is_left_alone() {
 
 mod folder_state;
 mod jpgs;
+mod mem_store;

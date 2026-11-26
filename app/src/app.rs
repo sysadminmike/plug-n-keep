@@ -13,6 +13,7 @@ mod dialogs;
 mod files_view;
 mod history_view;
 mod lists_view;
+mod place;
 mod progress;
 mod settings;
 mod setup;
@@ -30,12 +31,14 @@ use log::{debug, error, info, warn};
 use pnk_core::heic::made::FailedEntry;
 use pnk_core::history::SyncRecord;
 use pnk_core::idfile::IdFile;
+use pnk_core::modes::{self, Mode};
 use pnk_core::plan::{ARCHIVE_DIR, PlanEntry, ScanPlan, ScanProgress, Status};
 use pnk_core::platform::ListedDevice;
 use pnk_core::platform::notify::Watcher;
 use pnk_core::registry::{DeletedFiles, KnownDevice};
 use pnk_core::signals::DeviceKind;
 use pnk_core::state::{Config, LogLevel, NewDeviceDefaults, StateDir};
+use pnk_core::store::Destination;
 use pnk_core::sync::{ArchiveEvent, CopyMode, OldCopy, SyncEvent, SyncItem, SyncReport};
 
 use crate::Options;
@@ -45,10 +48,11 @@ use crate::logging::{self, Logger};
 use crate::queue::{self, Gate, Queue};
 use crate::theme;
 use crate::worker::{
-    self, Command, Event, Flags, FolderState, Found, How, Opened, ScanDone, Sizes, Stage,
-    SyncOutcome,
+    self, BucketInfo, Command, Event, Flags, FolderState, Found, How, Opened, SaveOutcome,
+    ScanDone, Sizes, Stage, SyncOutcome,
 };
 use dialogs::Dialog;
+use place::{PlaceDialog, TestState};
 use settings::{GlobalForm, SettingsForm};
 use setup::SetupForm;
 
@@ -285,6 +289,8 @@ enum Confirm {
         changed: usize,
     },
     ClaimFolder,
+    /// Throw away a bucket device's modified-time cache.
+    RebuildCache(String),
 }
 
 enum RowAction {
@@ -312,10 +318,31 @@ pub struct App {
     tx: Sender<Command>,
     rx: Receiver<Event>,
     flags: Flags,
+    /// The settings folder itself: Local mode's state, and where the last mode is kept.
+    base: StateDir,
+    /// S3 mode's state: the `s3` folder inside it.
+    s3_state: StateDir,
+    /// The mode shown. Each mode has its own list of devices and its own settings.
+    mode: Mode,
+    /// The current mode's state folder (`base` or `s3_state`).
     state: StateDir,
     /// The known devices, as the worker last said, and where each backup folder stands.
     known: Vec<KnownDevice>,
     folders: HashMap<String, FolderState>,
+    /// Where each bucket-backed device's bucket stands, and a line saying why when it is not
+    /// fine (from the worker's looks at start, on Refresh and before a scan).
+    s3_states: HashMap<String, (FolderState, String)>,
+    /// S3 mode: what the bucket says (where the look at it stands, the settings for new devices,
+    /// the forgotten devices, notes about devices). Nothing in Local mode.
+    bucket: BucketInfo,
+    /// Settings was saved and the bucket's answer has not come yet.
+    settings_saving: bool,
+    /// The next word from the bucket replaces what the Settings page shows for new devices.
+    reload_defaults: bool,
+    /// The Test button of the S3 fields.
+    s3_test: TestState,
+    /// "Change…" and "Add an existing backup…", which hold a place form.
+    place_dialog: Option<PlaceDialog>,
     devices: Vec<ListedDevice>,
     listing: bool,
     /// The listed device being ejected right now: the window waits for the system's answer.
@@ -380,6 +407,8 @@ pub struct App {
     global: Option<GlobalForm>,
     /// What "Find my backups" found.
     found: Option<Found>,
+    /// Where "Find my backups" looked, so Add looks there again.
+    found_in: Option<Destination>,
     /// Plug-in detection; stops when the window closes.
     #[allow(dead_code)]
     watcher: Option<Watcher>,
@@ -392,7 +421,8 @@ pub struct App {
 impl App {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
-        state: StateDir,
+        base: StateDir,
+        s3_state: StateDir,
         opts: Options,
         logger: &'static Logger,
     ) -> Self {
@@ -400,7 +430,29 @@ impl App {
         // While the Log panel is open, new lines repaint the window (a few times a second).
         let ctx = cc.egui_ctx.clone();
         logger.set_waker(move || ctx.request_repaint_after(logging::REPAINT_EVERY));
-        let config = state.config();
+        // S3 mode's files are copied once, as they are, before they are used the new way.
+        modes::keep_pre_bucket_copies(&s3_state);
+        // Once: bucket devices an earlier version kept in the Local list go to the S3 list.
+        // Before anything reads either list.
+        let moved = match modes::move_s3_devices(&base, &s3_state) {
+            Ok(r) if !r.moved.is_empty() => Some(format!(
+                "{} that back up to a bucket moved to S3 mode.",
+                format::plural(r.moved.len(), "device", "devices")
+            )),
+            Ok(_) => None,
+            Err(e) => {
+                warn!("Could not move bucket devices to the S3 list: {e}");
+                None
+            }
+        };
+        let mode = modes::load_mode(&base);
+        let state = match mode {
+            Mode::Local => base.clone(),
+            Mode::S3 => s3_state.clone(),
+        };
+        let mut config = state.config();
+        // The log level is the whole app's: it lives with the Local settings.
+        config.log_level = base.config().log_level;
         let flags = Flags::default();
         let fake = opts.fake_device.clone().map(|folder| worker::Fake {
             folder,
@@ -408,7 +460,7 @@ impl App {
             lag: opts.fake_lag,
             named: opts.fake_named,
         });
-        let (tx, rx) = worker::spawn(cc.egui_ctx.clone(), state.clone(), fake, flags.clone());
+        let (tx, rx) = worker::spawn(cc.egui_ctx.clone(), base.clone(), mode, fake, flags.clone());
         let _ = tx.send(Command::ListDevices);
         // A device plugged in or unplugged: the worker lists the devices again.
         let watcher = {
@@ -424,19 +476,32 @@ impl App {
                 }
             }
         };
-        let notice = opts.fake_device.as_ref().map(|d| {
-            format!(
-                "Fake-device mode: the files under {} stand in for a phone.",
-                d.display()
-            )
-        });
+        let notice = opts
+            .fake_device
+            .as_ref()
+            .map(|d| {
+                format!(
+                    "Fake-device mode: the files under {} stand in for a phone.",
+                    d.display()
+                )
+            })
+            .or(moved);
         Self {
             tx,
             rx,
             flags,
+            base,
+            s3_state,
+            mode,
             state,
             known: Vec::new(),
             folders: HashMap::new(),
+            s3_states: HashMap::new(),
+            bucket: BucketInfo::default(),
+            settings_saving: false,
+            reload_defaults: false,
+            s3_test: TestState::default(),
+            place_dialog: None,
             devices: Vec::new(),
             listing: true,
             ejecting: None,
@@ -477,6 +542,7 @@ impl App {
             form: None,
             global: None,
             found: None,
+            found_in: None,
             watcher,
             logger,
             log_view: LogView::new(),
@@ -567,6 +633,7 @@ impl App {
             scan_loaded: self.scan.is_some(),
             editing: self.confirm.is_some()
                 || self.dialog.is_some()
+                || self.place_dialog.is_some()
                 || self.after_rename.is_some()
                 || self.form.as_ref().is_some_and(|f| f.dirty()),
         }
@@ -601,6 +668,13 @@ impl App {
                 }
             }
             Event::Registry { devices, folders } => {
+                // A bucket's state is only good for the bucket it was worked out for.
+                self.s3_states.retain(|id, _| {
+                    let same = |d: &KnownDevice| d.id == *id;
+                    let before = self.known.iter().find(|d| same(d)).map(|d| &d.s3);
+                    let now = devices.iter().find(|d| same(d)).map(|d| &d.s3);
+                    before == now && now.is_some_and(Option::is_some)
+                });
                 self.known = devices;
                 self.folders = folders.into_iter().collect();
                 self.sync_forms();
@@ -642,6 +716,19 @@ impl App {
                 }
             }
             Event::Found(found) => self.found = Some(*found),
+            Event::S3State { id, state, detail } => {
+                self.s3_states.insert(id, (state, detail));
+            }
+            Event::S3Tested(outcome) => {
+                let ok = outcome.is_ok();
+                self.s3_test.finished(outcome);
+                // A bucket that works is looked in again: its devices and settings.
+                if ok && self.mode == Mode::S3 {
+                    self.send(Command::RefreshBucket);
+                }
+            }
+            Event::Bucket(info) => self.on_bucket(*info),
+            Event::BucketSaved(outcome) => self.on_bucket_saved(outcome),
             Event::Sizes { id, sizes } => {
                 self.sizes.insert(id, *sizes);
             }
@@ -799,6 +886,8 @@ impl App {
                         &self.config.new_devices,
                         &self.backups_root(),
                         &self.known,
+                        self.mode,
+                        self.config.default_s3.as_ref(),
                     ));
                 }
             },
@@ -1078,17 +1167,80 @@ impl App {
         self.heic_check = None;
         self.listing = true;
         self.send(Command::ListDevices);
-    }
-
-    pub(super) fn save_config(&mut self) {
-        if let Err(e) = self.state.save_config(&self.config) {
-            error!("Could not save the settings: {e}");
-            self.error = Some(format!("Could not save the settings: {e}"));
+        // The buckets too: a server that was away may be back.
+        self.send(Command::CheckStores);
+        if self.mode == Mode::S3 {
+            self.send(Command::RefreshBucket);
         }
     }
 
-    /// The Record choice in the Log panel: applies at once, and is saved like the folder.
-    fn set_log_level(&mut self, level: LogLevel) {
+    /// What the bucket says (S3 mode). What new devices start with is the bucket's: the window's
+    /// copy follows it, and a Settings page that hasn't been edited shows it.
+    fn on_bucket(&mut self, info: BucketInfo) {
+        if self.mode != Mode::S3 {
+            return;
+        }
+        if let Some(nd) = &info.settings {
+            let old = self.config.new_devices.clone();
+            let force = std::mem::take(&mut self.reload_defaults);
+            if let Some(form) = &mut self.global
+                && (force || !form.defaults_edited(&old))
+            {
+                form.set_defaults(nd);
+            }
+            self.config.new_devices = nd.clone();
+        }
+        self.bucket = info;
+    }
+
+    /// How "Save settings" ended in S3 mode.
+    fn on_bucket_saved(&mut self, outcome: SaveOutcome) {
+        self.settings_saving = false;
+        let mut close = true;
+        match outcome {
+            SaveOutcome::Saved => {
+                self.error = None;
+                self.notice = Some("Settings saved.".into());
+            }
+            SaveOutcome::ConnectionOnly(why) => {
+                self.notice = None;
+                self.error = Some(format!(
+                    "The connection is saved, but what new devices start with could not be saved in the bucket: {why}"
+                ));
+            }
+            SaveOutcome::Loaded => {
+                self.reload_defaults = true;
+                self.error = None;
+                self.notice = Some(
+                    "Connected. This bucket already had settings for new devices, so those are used; its devices are being listed."
+                        .into(),
+                );
+            }
+            SaveOutcome::Conflict => {
+                // Theirs are shown; the user's typing is not saved over them.
+                close = false;
+                self.reload_defaults = true;
+                self.notice = None;
+                if let Some(form) = &mut self.global {
+                    form.problems = vec![
+                        "Settings were changed on another PC; they've been reloaded, please save again."
+                            .into(),
+                    ];
+                }
+            }
+            SaveOutcome::Failed(e) => {
+                close = false;
+                self.error = Some(format!("The settings were not saved in the bucket: {e}"));
+            }
+        }
+        if close {
+            self.global = None;
+        }
+    }
+
+    /// The Record choice in the Log panel (and Settings): applies at once, and is saved with
+    /// the Local settings, whichever mode is shown: it is the whole app's.
+    pub(super) fn set_log_level(&mut self, level: LogLevel) {
         if level == self.config.log_level {
             return;
         }
@@ -1106,7 +1258,99 @@ impl App {
         if more {
             info!("{line}");
         }
-        self.save_config();
+        match self.mode {
+            Mode::Local => self.save_config(),
+            Mode::S3 => {
+                let mut local = self.base.config();
+                local.log_level = level;
+                if let Err(e) = self.base.save_config(&local) {
+                    error!("Could not save the settings: {e}");
+                    self.error = Some(format!("Could not save the settings: {e}"));
+                }
+            }
+        }
+    }
+
+    /// The Settings page, for the current mode.
+    pub(super) fn open_settings(&mut self) {
+        self.global = Some(GlobalForm::new(
+            &self.config,
+            self.backups_root(),
+            self.mode,
+        ));
+        self.found = None;
+    }
+
+    /// The Local / S3 switch. Everything shown for the old mode goes (the devices, the open
+    /// device, the scan, the forms) and the worker takes the other mode's list. The devices
+    /// that are plugged in are looked at again from the start, in the new mode. Not while
+    /// anything is running.
+    pub(super) fn switch_mode(&mut self, mode: Mode) {
+        if mode == self.mode || !self.idle() {
+            return;
+        }
+        info!("Switching to {} mode", mode.label());
+        if let Err(e) = modes::save_mode(&self.base, mode) {
+            warn!("Could not remember the mode: {e}");
+        }
+        let level = self.config.log_level;
+        self.mode = mode;
+        self.state = match mode {
+            Mode::Local => self.base.clone(),
+            Mode::S3 => self.s3_state.clone(),
+        };
+        self.config = self.state.config();
+        self.config.log_level = level;
+        self.known.clear();
+        self.folders.clear();
+        self.s3_states.clear();
+        self.bucket = BucketInfo::default();
+        self.settings_saving = false;
+        self.reload_defaults = false;
+        self.s3_test = TestState::default();
+        self.place_dialog = None;
+        self.devices.clear();
+        self.links.clear();
+        self.queue = Queue::default();
+        self.selected = None;
+        self.current = None;
+        self.device = DeviceState::None;
+        self.auto_opened = None;
+        self.scan_when_ready = false;
+        self.session_dropped = false;
+        self.forget_ejected();
+        self.ejected = None;
+        self.setup = None;
+        self.form = None;
+        self.page = PageTab::Files;
+        self.sizes.clear();
+        self.history.clear();
+        self.history_row = None;
+        self.scan = None;
+        self.skip_list = None;
+        self.filter_dirty = true;
+        self.deferred.clear();
+        self.last_failed = None;
+        self.found = None;
+        self.found_in = None;
+        self.confirm = None;
+        self.dialog = None;
+        self.after_rename = None;
+        self.error = None;
+        self.notice = None;
+        if self.global.is_some() {
+            self.open_settings();
+        }
+        self.send(Command::SetMode(mode));
+        self.listing = true;
+        self.send(Command::ListDevices);
+    }
+
+    pub(super) fn save_config(&mut self) {
+        if let Err(e) = self.state.save_config(&self.config) {
+            error!("Could not save the settings: {e}");
+            self.error = Some(format!("Could not save the settings: {e}"));
+        }
     }
 
     /// The device thread has ended (it panicked, or couldn't start): nothing will answer any
@@ -1164,6 +1408,7 @@ impl eframe::App for App {
         if matches!(self.busy, Busy::Syncing(_))
             && self.confirm.is_none()
             && self.dialog.is_none()
+            && self.place_dialog.is_none()
             && !ctx.text_edit_focused()
             && ctx.input(|i| i.key_pressed(Key::S))
         {
@@ -1229,6 +1474,7 @@ impl eframe::App for App {
             });
         self.confirm_dialog(&ctx);
         self.dialog_ui(&ctx);
+        self.place_dialog_ui(&ctx);
     }
 }
 
@@ -1251,6 +1497,11 @@ fn outcome_summary(o: &SyncOutcome, copied_bytes: u64) -> (String, Option<String
     let mut error = None;
     match &o.archive {
         Some(Ok(a)) => {
+            if let Some(why) = &a.offline {
+                error = Some(format!(
+                    "{why}. The backup could not be reached, so moving the deleted files stopped there."
+                ));
+            }
             if let Some(folder) = &a.folder {
                 notice += &format!(
                     " Moved {} deleted from the device into \"{}\".",
@@ -1350,7 +1601,12 @@ fn sync_summary(r: &SyncReport, copied_bytes: u64) -> String {
     if r.failed > 0 {
         parts.push(format!("{} failed", format::count(r.failed)));
     }
-    let head = if r.cancelled || r.must_reconnect || r.disk_full || r.connection_lost.is_some() {
+    let head = if r.cancelled
+        || r.must_reconnect
+        || r.disk_full
+        || r.connection_lost.is_some()
+        || r.offline.is_some()
+    {
         "Sync stopped"
     } else if r.failed > 0 {
         "Sync finished with errors"
@@ -1365,6 +1621,10 @@ fn sync_summary(r: &SyncReport, copied_bytes: u64) -> String {
         if r.must_reconnect {
             s += " The transfer was cut short, so the connection to the device was reset too.";
         }
+    } else if let Some(why) = &r.offline {
+        s += &format!(
+            " {why}. The backup could not be reached, so the sync stopped there; nothing already backed up was touched. Scan again when it is back."
+        );
     } else if r.connection_lost.is_some() {
         s += " The device stopped answering, so the sync stopped there. Unplug it, unlock it, plug                it back in, then scan again to carry on.";
     } else if r.must_reconnect {

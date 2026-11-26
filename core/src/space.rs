@@ -19,6 +19,7 @@
 
 use crate::plan::{ScanPlan, Status};
 use crate::platform::DiskSpace;
+use crate::store::{BackupStore, Kind, LocalStore};
 use crate::sync::{CopyMode, SyncItem};
 
 /// How big a JPG copy of a HEIC photo is expected to be, as a multiple of the HEIC's size. A
@@ -147,62 +148,65 @@ pub struct FolderSizes {
 /// counted; what can't be read is left out. Only reads, and slow on a big folder: run it off the
 /// window's thread.
 pub fn folder_sizes(root: &std::path::Path, archive_names: &[String]) -> FolderSizes {
-    folder_sizes_within(root, archive_names, WALK_LIMIT)
+    folder_sizes_in(&LocalStore::new(root), archive_names)
+}
+
+/// [`folder_sizes`] for any [`BackupStore`].
+pub fn folder_sizes_in(store: &dyn BackupStore, archive_names: &[String]) -> FolderSizes {
+    folder_sizes_within(store, archive_names, WALK_LIMIT)
 }
 
 /// The longest a folder walk runs. A share that hangs would otherwise keep the walk (and its
 /// thread) forever; what was counted by then is the answer, which is only an estimate anyway.
 const WALK_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// [`folder_sizes`], giving up after `limit`. A file still being written (`.pnk-part`, `.pnk-jpg-part`) is not
+/// [`folder_sizes_in`], giving up after `limit`. A file still being written (`.pnk-part`, `.pnk-jpg-part`) is not
 /// counted.
 pub fn folder_sizes_within(
-    root: &std::path::Path,
+    store: &dyn BackupStore,
     archive_names: &[String],
     limit: std::time::Duration,
 ) -> FolderSizes {
     let started = std::time::Instant::now();
     let mut sizes = FolderSizes::default();
-    for entry in walkdir::WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .flatten()
-    {
+    let over = std::cell::Cell::new(false);
+    // Stops going into more folders once the time is up.
+    let prune = |_: &str| {
         if started.elapsed() > limit {
+            over.set(true);
+        }
+        over.get()
+    };
+    let Ok(listing) = store.list(&prune) else {
+        return sizes;
+    };
+    for f in &listing.files {
+        if started.elapsed() > limit {
+            over.set(true);
+        }
+        if over.get() {
             log::warn!(
                 "Counting the size of {} took too long; the figures are partial",
-                root.display()
+                store.describe()
             );
             break;
         }
-        if !entry.file_type().is_file() {
+        if f.kind != Kind::File {
             continue;
         }
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(crate::paths::is_temp_name)
-        {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else {
-            continue;
+        let (folder, name) = match f.rel.rsplit_once('/') {
+            Some((dir, name)) => (Some(dir), name),
+            None => (None, f.rel.as_str()),
         };
-        let len = meta.len();
-        sizes.total = sizes.total.saturating_add(len);
+        if crate::paths::is_temp_name(name) {
+            continue;
+        }
+        sizes.total = sizes.total.saturating_add(f.size);
         sizes.files += 1;
-        let first = entry
-            .path()
-            .strip_prefix(root)
-            .ok()
-            .and_then(|p| p.components().next())
-            .and_then(|c| c.as_os_str().to_str());
         // A file directly in the folder has no "first folder": its own name is not an archive.
-        let in_a_folder = entry.depth() > 1;
-        if in_a_folder
-            && first.is_some_and(|f| archive_names.iter().any(|a| a.eq_ignore_ascii_case(f)))
-        {
-            sizes.archive = sizes.archive.saturating_add(len);
+        let first = folder.and_then(|d| d.split('/').next());
+        if first.is_some_and(|f| archive_names.iter().any(|a| a.eq_ignore_ascii_case(f))) {
+            sizes.archive = sizes.archive.saturating_add(f.size);
         }
     }
     sizes

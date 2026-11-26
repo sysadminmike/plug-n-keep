@@ -23,6 +23,11 @@ allow = [
     # jpeg-encoder: "(MIT OR Apache-2.0) AND IJG". The IJG licence is a permissive BSD-style one.
     "IJG",
     "Unicode-3.0",
+    # rusty-s3 (BSD-2-Clause), subtle (BSD-3-Clause): permissive BSD licences.
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # webpki-roots: the Mozilla root certificate list, under a permissive data licence.
+    "CDLA-Permissive-2.0",
     "OFL-1.1",
     "Ubuntu-font-1.0",
 ]

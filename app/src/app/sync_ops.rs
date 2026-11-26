@@ -303,12 +303,14 @@ impl App {
             self.notice = Some("Opening the device again, then scanning…".into());
             return;
         }
-        let Some(folder) = self.active().and_then(|(_, d, _)| d.backup_dir.clone()) else {
+        let Some(dest) = self.active().and_then(|(_, d, _)| d.destination()) else {
             warn!("Scan not started: no device is ready, or it has no backup folder");
             self.error = Some("Choose a backup folder for this device first.".into());
             return;
         };
-        if !folder.is_absolute() {
+        if let Destination::Local(folder) = &dest
+            && !folder.is_absolute()
+        {
             warn!(
                 "Scan not started: \"{}\" is not a full path",
                 folder.display()
@@ -319,13 +321,22 @@ impl App {
             ));
             return;
         }
-        info!("Scan clicked: backup folder {}", folder.display());
+        // A bucket that can't be reached or used says so; nothing is scanned.
+        if let Some(d) = self.active().map(|(_, d, _)| d.clone())
+            && d.s3.is_some()
+            && self.folder_state(&d).blocks()
+        {
+            warn!("Scan not started: the bucket can't be used right now");
+            self.error = self.s3_states.get(&d.id).map(|(_, t)| t.clone());
+            return;
+        }
+        info!("Scan clicked: backup place {}", dest.label().display());
         self.clear_scan();
         self.notice = None;
         self.error = None;
         self.flags.scan_cancel.store(false, Ordering::Relaxed);
         self.busy = Busy::Scanning(None);
-        self.send(Command::Scan(folder));
+        self.send(Command::Scan(dest));
     }
 
     pub(super) fn cancel_scan(&mut self) {
@@ -512,6 +523,12 @@ impl App {
 
     /// `alt`: the dialog's second choice (only for Archive: sync without archiving).
     pub(super) fn confirmed(&mut self, c: Confirm, alt: bool) {
+        if let Confirm::RebuildCache(id) = c {
+            info!("Rebuild the modified-time cache confirmed");
+            self.clear_scan();
+            self.send(Command::RebuildMtimeCache { id });
+            return;
+        }
         let Some(scan) = &self.scan else { return };
         let plan_id = scan.plan_id;
         match c {
@@ -535,6 +552,7 @@ impl App {
                 }
                 self.start_sync(items, !alt && count > 0, !alt)
             }
+            Confirm::RebuildCache(_) => {}
             Confirm::ClaimFolder => {
                 if let Some(device_page::ClaimOffer::Refused(why)) =
                     device_page::claim_offer(&scan.plan)

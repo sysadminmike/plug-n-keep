@@ -1,10 +1,11 @@
 //! What a plugged-in device needs before it can be backed up: the questions recognition may ask
 //! (DESIGN.md section 5.2) and the new-device card (section 8).
 
-use std::path::PathBuf;
-
+use pnk_core::modes::Mode;
 use pnk_core::registry::DeviceSettings;
+use pnk_core::store::{Destination, S3Config};
 
+use super::place::PlaceForm;
 use super::settings::{Fields, fields_ui};
 use super::*;
 use crate::questions::{Answer, Question, question_text};
@@ -14,7 +15,8 @@ use crate::worker::{NewDevice, Setup};
 /// The new-device card's working copy.
 pub(super) struct SetupForm {
     name: String,
-    folder: String,
+    /// Where the backup goes: a folder (Local mode) or a folder in the bucket (S3 mode).
+    place: PlaceForm,
     fields: Fields,
     kind: DeviceKind,
     /// The ID on the stick came from another PC: adopt it.
@@ -31,6 +33,7 @@ pub(super) struct SetupForm {
 }
 
 impl SetupForm {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         setup: &Setup,
         kind: DeviceKind,
@@ -38,11 +41,19 @@ impl SetupForm {
         defaults: &NewDeviceDefaults,
         root: &std::path::Path,
         known: &[KnownDevice],
+        mode: Mode,
+        s3_server: Option<&S3Config>,
     ) -> Self {
         let folder = suggested_folder(root, &setup.suggested_name, known);
+        let folder_name = crate::validate::folder_name_for(&setup.suggested_name);
         Self {
             name: setup.suggested_name.clone(),
-            folder: folder.display().to_string(),
+            place: PlaceForm::new(
+                mode,
+                folder.display().to_string(),
+                s3_server.cloned(),
+                folder_name,
+            ),
             fields: Fields::new(&defaults.settings_for(kind, signals)),
             kind,
             foreign_id: setup.foreign_id.clone(),
@@ -53,6 +64,11 @@ impl SetupForm {
             linking: false,
             problem: None,
         }
+    }
+
+    /// Settings were saved: the card takes the S3 server as it is now.
+    pub fn set_s3_server(&mut self, s3_server: Option<&S3Config>) {
+        self.place.set_base(s3_server.cloned());
     }
 
     /// The worker says something about the stick's ID changed (a new one was written).
@@ -163,13 +179,15 @@ impl App {
         let idle = self.idle();
         let jpeg = self.heic_ok();
         // The note about the folder is worked out when the text changes, not every frame.
-        if form.noted != form.folder {
-            form.noted = form.folder.clone();
-            form.note = match check_backup_folder(&form.folder) {
+        if form.place.mode == Mode::Local && form.noted != form.place.folder {
+            form.noted = form.place.folder.clone();
+            form.note = match check_backup_folder(&form.place.folder) {
                 Ok(p) => folder_note(&p, None, &self.known),
                 Err(_) => FolderNote::Fine,
             };
         }
+        // The folder in the bucket follows the device's name until it is typed over.
+        form.place.follow_name(&form.name);
         ui.add_space(4.0);
         ui.label(
             RichText::new("New device")
@@ -184,6 +202,7 @@ impl App {
         let mut save = false;
         let mut link: Option<String> = None;
         let mut write_new_id = false;
+        let mut open_settings = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -200,32 +219,19 @@ impl App {
                                     .desired_width(320.0),
                             );
                             ui.end_row();
-                            ui.label(RichText::new("Backup folder").color(theme::WEAK));
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut form.folder)
-                                        .margin(egui::Margin::symmetric(8, 4))
-                                        .desired_width(320.0),
-                                );
-                                if ui.button("Browse…").clicked() {
-                                    let mut dialog =
-                                        rfd::FileDialog::new().set_title("Choose the backup folder");
-                                    let current = std::path::Path::new(form.folder.trim());
-                                    if let Some(parent) = current
-                                        .parent()
-                                        .filter(|p| p.is_dir())
-                                        .or_else(|| current.is_dir().then_some(current))
-                                    {
-                                        dialog = dialog.set_directory(parent);
-                                    }
-                                    if let Some(dir) = dialog.pick_folder() {
-                                        form.folder = dir.display().to_string();
-                                    }
-                                }
-                            });
-                            ui.end_row();
                         });
-                    if let Some(text) = form.note.text() {
+                    ui.add_space(4.0);
+                    open_settings = self.place_ui(
+                        ui,
+                        &mut form.place,
+                        "new-device",
+                        "Choose the backup folder",
+                        "Folder name",
+                        true,
+                    );
+                    if form.place.mode == Mode::Local
+                        && let Some(text) = form.note.text()
+                    {
                         ui.add_space(2.0);
                         ui.label(
                             RichText::new(text)
@@ -233,7 +239,16 @@ impl App {
                         );
                     }
                     ui.add_space(6.0);
-                    fields_ui(ui, &mut form.fields, form.kind, false, &Vec::new(), "new", &jpeg);
+                    fields_ui(
+                        ui,
+                        &mut form.fields,
+                        form.kind,
+                        false,
+                        &Vec::new(),
+                        "new",
+                        &jpeg,
+                        form.place.mode == Mode::S3,
+                    );
                 });
                 if let Some(name) = form.clash.clone() {
                     let text = format!(
@@ -261,7 +276,7 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(idle, theme::primary("Save and scan"))
+                        .add_enabled(idle && form.place.ready(), theme::primary("Save and scan"))
                         .on_hover_text("Remember this device and compare it with the backup folder. Nothing is copied until you click Start sync.")
                         .clicked()
                     {
@@ -288,6 +303,9 @@ impl App {
                     });
                 }
             });
+        if open_settings {
+            self.open_settings();
+        }
         if write_new_id {
             info!("Write a new ID on the copied stick: Yes");
             self.send(Command::ReplaceIdFile {
@@ -321,21 +339,23 @@ impl App {
         if name.is_empty() {
             return Err("Give the device a name.".into());
         }
-        let backup_dir: PathBuf = check_backup_folder(&form.folder)?;
-        let note = folder_note(&backup_dir, None, &self.known);
-        if note.blocks() {
-            return Err(note.text().unwrap_or_default());
-        }
-        let settings: DeviceSettings = form.fields.apply(&[]).map_err(|p| {
+        let destination: Destination = form.place.destination(&self.known, None)?;
+        let mut settings: DeviceSettings = form.fields.apply(&[]).map_err(|p| {
             p.into_iter()
                 .map(|(what, why)| format!("{what}: {why}"))
                 .collect::<Vec<_>>()
                 .join(" ")
         })?;
+        // A bucket has no Recycle Bin: those files are archived instead.
+        if matches!(destination, Destination::S3(_))
+            && settings.deleted_files == pnk_core::registry::DeletedFiles::RecycleBin
+        {
+            settings.deleted_files = pnk_core::registry::DeletedFiles::Archive;
+        }
         Ok(NewDevice {
             device: self.current.clone().unwrap_or_default(),
             name,
-            backup_dir,
+            destination,
             settings,
             use_id_file_id: form.use_stick_id && form.foreign_id.is_some(),
         })

@@ -18,20 +18,19 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use log::{debug, error, info, warn};
 
-use crate::heic::made::{FailedEntry, MadeEntry, MadeList, facts_of, from_ms, to_ms};
+use crate::heic::made::{FailedEntry, MadeEntry, MadeList, facts_in, facts_of, from_ms, to_ms};
 use crate::heic::{self, MakeError};
 use crate::owner::{self, OwnerState};
-use crate::paths::{SafeRelPath, is_link, prepare_parent};
+use crate::paths::{SafeRelPath, prepare_parent};
 use crate::plan::{self, BackupIndex, ScanPlan, same_modified};
-use crate::platform;
 use crate::signals::View;
+use crate::store::{BackupStore, Kind, LocalStore, Stat};
 use crate::sync::SyncError;
 
 /// A HEIC on the device that is being backed up, and the JPG that would sit beside it in the
@@ -286,19 +285,18 @@ struct Work {
     jpg: SafeRelPath,
 }
 
-fn plain_file(path: &Path) -> Option<fs::Metadata> {
-    fs::symlink_metadata(path)
+fn plain_file(store: &dyn BackupStore, rel: &SafeRelPath) -> Option<Stat> {
+    store
+        .stat(rel)
         .ok()
-        .filter(|m| m.is_file() && !is_link(m))
+        .flatten()
+        .filter(|st| st.kind == Kind::File)
 }
 
-/// Whether anything is at `path` (a link, a folder, anything). A path that can't be checked
+/// Whether anything is at `rel` (a link, a folder, anything). A name that can't be checked
 /// counts as taken: nothing is written over what can't be seen.
-fn exists(path: &Path) -> bool {
-    match fs::symlink_metadata(path) {
-        Err(e) => e.kind() != io::ErrorKind::NotFound,
-        Ok(_) => true,
-    }
+fn exists(store: &dyn BackupStore, rel: &SafeRelPath) -> bool {
+    !matches!(store.stat(rel), Ok(None))
 }
 
 fn failed_entry(
@@ -320,8 +318,8 @@ fn failed_entry(
 
 /// Saves the list after a change. A list that can't be saved stops the step: a JPG the list
 /// doesn't know about would look like a file of the device's.
-fn save(made: &MadeList, root: &Path, report: &mut JpgReport) -> bool {
-    match made.save(root) {
+fn save(made: &MadeList, store: &dyn BackupStore, report: &mut JpgReport) -> bool {
+    match made.save_in(store) {
         Ok(()) => true,
         Err(e) => {
             let why =
@@ -336,7 +334,7 @@ fn save(made: &MadeList, root: &Path, report: &mut JpgReport) -> bool {
 /// Looks at every candidate in the backup as it is now, and sorts it: what to make, and what
 /// to count or record. Records the HEICs whose name is taken.
 fn sort_out(
-    root_canon: &Path,
+    store: &dyn BackupStore,
     made: &mut MadeList,
     candidates: Vec<(SafeRelPath, SafeRelPath)>,
     report: &mut JpgReport,
@@ -345,13 +343,13 @@ fn sort_out(
     let mut work = Vec::new();
     let mut recorded = false;
     for (heic, jpg) in candidates {
-        let Some(meta) = plain_file(&heic.under(root_canon)) else {
+        let Some(meta) = plain_file(store, &heic) else {
             debug!("No JPG for {heic}: it isn't a plain file in the backup (yet)");
             continue;
         };
-        let size = meta.len();
-        let modified = meta.modified().ok();
-        let target_exists = exists(&jpg.under(root_canon));
+        let size = meta.size;
+        let modified = meta.mtime;
+        let target_exists = exists(store, &jpg);
         match decide(
             made,
             heic.as_str(),
@@ -392,14 +390,15 @@ fn sort_out(
         }
     }
     if recorded {
-        let _ = save(made, root_canon, report);
+        let _ = save(made, store, report);
     }
     work
 }
 
 /// Makes the JPGs in `work`, one at a time, saving the list after each.
 fn make_all(
-    root_canon: &Path,
+    store: &dyn BackupStore,
+    root_canon: Option<&Path>,
     made: &mut MadeList,
     work: Vec<Work>,
     cancel: &AtomicBool,
@@ -429,28 +428,24 @@ fn make_all(
             total: work.len(),
             heic: heic_name.clone(),
         });
-        let (heic_full, meta) = {
-            let p = w.heic.under(root_canon);
-            let m = plain_file(&p);
-            (p, m)
-        };
-        let Some(meta) = meta else {
+        let Some(meta) = plain_file(store, &w.heic) else {
             continue;
         };
         // Room for this JPG, with the margin a sync keeps. Not one photo's fault, so nothing is
         // recorded against it; what was made so far stays.
-        if let Err(short) = crate::space::check_jpg(meta.len(), platform::disk_space(root_canon)) {
+        if let Err(short) = crate::space::check_jpg(meta.size, store.space()) {
             let why = format!("making JPG copies stopped: {short}");
             warn!("{why}");
             report.error = Some(why);
             break;
         }
-        let jpg_full = match prepare_parent(root_canon, &w.jpg) {
-            Ok(dir) => dir.join(w.jpg.file_name()),
-            Err(e) => {
+        // A folder on this PC: the JPG's folder is made and checked. An object store has none.
+        let jpg_full = match root_canon.map(|r| prepare_parent(r, &w.jpg)) {
+            Some(Ok(dir)) => Some(dir.join(w.jpg.file_name())),
+            Some(Err(e)) => {
                 fail(
                     made,
-                    root_canon,
+                    store,
                     report,
                     on_event,
                     &w.heic,
@@ -459,13 +454,14 @@ fn make_all(
                 );
                 continue;
             }
+            None => None,
         };
         // The entry goes into the list before the JPG is written: a crash between the write and
         // the save would otherwise leave a JPG the list doesn't know, which would later be taken
         // for the device's own and archived as "deleted" on its own. The entry has no facts of the
         // JPG yet; the JPG gets its HEIC's modified time, and that is what it is then known by
         // ([`MadeList::load`]). Not if something is at the name already: that file isn't ours.
-        if exists(&jpg_full) {
+        if exists(store, &w.jpg) {
             // Taken since the sort: looked at again at the next scan, like any taken name.
             let reason = Decision::Taken
                 .reason(w.jpg.file_name())
@@ -474,8 +470,8 @@ fn make_all(
             made.set_failed(failed_entry(
                 &heic_name,
                 reason.clone(),
-                meta.len(),
-                meta.modified().ok(),
+                meta.size,
+                meta.mtime,
                 true,
             ));
             report.failed += 1;
@@ -483,30 +479,38 @@ fn make_all(
                 heic: heic_name,
                 reason,
             });
-            let _ = save(made, root_canon, report);
+            let _ = save(made, store, report);
             continue;
         }
         made.insert(MadeEntry {
             jpg: w.jpg.as_str().to_string(),
             heic: heic_name.clone(),
-            heic_size: meta.len(),
-            heic_modified_ms: meta.modified().map_or(0, to_ms),
+            heic_size: meta.size,
+            heic_modified_ms: meta.mtime.map_or(0, to_ms),
             made: crate::platform::utc_stamp(),
             jpg_size: None,
             jpg_modified_ms: None,
         });
-        if !save(made, root_canon, report) {
+        if !save(made, store, report) {
             made.remove_jpg(w.jpg.as_str());
             break;
         }
-        let result = heic::make_jpeg(&heic_full, &jpg_full, heic::QUALITY);
+        let result = match (root_canon, &jpg_full) {
+            (Some(root), Some(jpg_full)) => {
+                heic::make_jpeg(&w.heic.under(root), jpg_full, heic::QUALITY).map(|info| {
+                    let facts = facts_of(jpg_full);
+                    (info, facts)
+                })
+            }
+            _ => make_in_store(store, w, &meta),
+        };
         if result.is_err() {
             // Nothing was written: the provisional entry goes again.
             made.remove_jpg(w.jpg.as_str());
         }
         match result {
-            Ok(info) => {
-                let (jpg_size, jpg_modified_ms) = match facts_of(&jpg_full) {
+            Ok((info, facts)) => {
+                let (jpg_size, jpg_modified_ms) = match facts {
                     Some((s, m)) => (Some(s), Some(m)),
                     None => (None, None),
                 };
@@ -526,18 +530,18 @@ fn make_all(
                     heic: heic_name,
                     jpg: w.jpg.as_str().to_string(),
                 });
-                if !save(made, root_canon, report) {
+                if !save(made, store, report) {
                     break;
                 }
             }
             Err(MakeError::DecoderMissing(hint)) => {
                 warn!("Making JPG copies stopped: {hint}");
                 report.unavailable = Some(hint);
-                let _ = made.save(root_canon); // without the provisional entry
+                let _ = made.save_in(store); // without the provisional entry
                 break;
             }
             Err(MakeError::Io(why)) => {
-                let _ = made.save(root_canon);
+                let _ = made.save_in(store);
                 // Not this photo's fault (a full disk, a read-only folder): not recorded
                 // against it, and the rest would fail the same way.
                 let why = format!("a JPG could not be written ({why}); making JPG copies stopped");
@@ -547,7 +551,7 @@ fn make_all(
             }
             Err(e) => {
                 let reason = e.to_string();
-                fail(made, root_canon, report, on_event, &w.heic, reason, &meta);
+                fail(made, store, report, on_event, &w.heic, reason, &meta);
             }
         }
     }
@@ -562,19 +566,19 @@ fn make_all(
 
 fn fail(
     made: &mut MadeList,
-    root: &Path,
+    store: &dyn BackupStore,
     report: &mut JpgReport,
     on_event: &mut dyn FnMut(JpgEvent),
     heic: &SafeRelPath,
     reason: String,
-    meta: &fs::Metadata,
+    meta: &Stat,
 ) {
     warn!("No JPG for {heic}: {reason}");
     made.set_failed(failed_entry(
         heic.as_str(),
         reason.clone(),
-        meta.len(),
-        meta.modified().ok(),
+        meta.size,
+        meta.mtime,
         false,
     ));
     report.failed += 1;
@@ -582,7 +586,50 @@ fn fail(
         heic: heic.as_str().to_string(),
         reason,
     });
-    let _ = save(made, root, report);
+    let _ = save(made, store, report);
+}
+
+/// The most of a HEIC that is brought over from an object store to be decoded (it is held in
+/// memory and written to a temporary file).
+const MAX_DOWNLOAD: u64 = 512 << 20;
+
+/// Makes one JPG copy in an object store: the HEIC is read whole, decoded through a temporary file
+/// ([`heic::convert_bytes`]), and the JPG is uploaded with the HEIC's modified time and made to
+/// appear only if its name is still free. Returns what was made and the JPG's size and time as
+/// the store now has them.
+fn make_in_store(
+    store: &dyn BackupStore,
+    w: &Work,
+    meta: &Stat,
+) -> Result<(heic::MadeInfo, Option<(u64, i64)>), MakeError> {
+    if meta.size > MAX_DOWNLOAD {
+        return Err(MakeError::Unsupported(
+            "the photo is too large to convert from here".into(),
+        ));
+    }
+    let bytes = match store.read(&w.heic) {
+        Ok(Some((b, _))) => b,
+        Ok(None) => return Err(MakeError::Damaged("it is gone from the backup".into())),
+        Err(e) => return Err(MakeError::Io(format!("it can't be read ({e})"))),
+    };
+    let (jpg, info) = heic::convert_bytes(&bytes, w.heic.file_name(), meta.mtime, heic::QUALITY)?;
+    drop(bytes);
+    let io = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            MakeError::TargetExists
+        } else {
+            MakeError::Io(crate::store::explain(&e))
+        }
+    };
+    let mut up = store
+        .begin_upload(&w.jpg, jpg.len() as u64, Some(info.heic_modified))
+        .map_err(io)?;
+    if let Err(e) = up.write(&jpg).and_then(|()| up.seal()) {
+        let _ = up.abort();
+        return Err(io(e));
+    }
+    up.finish_no_replace().map_err(io)?;
+    Ok((info, facts_in(store, &w.jpg)))
 }
 
 /// The sync's JPG step: makes a JPG beside each HEIC of the plan that needs one, after the
@@ -590,6 +637,17 @@ fn fail(
 /// (`cancel`) ends it between two photos. Refuses, like the rest of the sync, if the backup
 /// folder isn't this device's.
 pub fn make_jpegs(
+    plan: &ScanPlan,
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(JpgEvent),
+) -> Result<JpgReport, SyncError> {
+    make_jpegs_in(&LocalStore::new(&plan.root), plan, cancel, on_event)
+}
+
+/// [`make_jpegs`] over a store. In an object store the HEIC is downloaded to a temporary file to
+/// be decoded and the JPG is uploaded from memory ([`make_in_store`]).
+pub fn make_jpegs_in(
+    store: &dyn BackupStore,
     plan: &ScanPlan,
     cancel: &AtomicBool,
     on_event: &mut dyn FnMut(JpgEvent),
@@ -602,9 +660,18 @@ pub fn make_jpegs(
         report.unavailable = Some(hint);
         return Ok(report);
     }
-    let root_canon = crate::sync::checked_root(plan)?;
-    crate::sync::check_owner(plan, &root_canon)?;
-    let mut made = MadeList::load(&root_canon);
+    let root_canon = crate::sync::owner_root(store, plan)?;
+    let local = store.as_local().is_some();
+    if local {
+        crate::sync::check_owner(plan, &root_canon)?;
+    } else {
+        crate::sync::check_owner_in(store, plan)?;
+    }
+    let mut made = if local {
+        MadeList::load(&root_canon)
+    } else {
+        MadeList::load_in(store)
+    };
     if let Some(why) = &made.save_blocked {
         return Err(SyncError::Io(format!("no JPG copies were made: {why}")));
     }
@@ -614,8 +681,16 @@ pub fn make_jpegs(
         .iter()
         .map(|c| (c.heic.clone(), c.jpg.clone()))
         .collect();
-    let work = sort_out(&root_canon, &mut made, candidates, &mut report, on_event);
-    make_all(&root_canon, &mut made, work, cancel, &mut report, on_event);
+    let work = sort_out(store, &mut made, candidates, &mut report, on_event);
+    make_all(
+        store,
+        local.then_some(root_canon.as_path()),
+        &mut made,
+        work,
+        cancel,
+        &mut report,
+        on_event,
+    );
     Ok(report)
 }
 
@@ -629,7 +704,18 @@ pub fn forget_failures(
     heics: Option<&[String]>,
 ) -> Result<usize, SyncError> {
     let root_canon = owned_root(root, device_key, view)?;
-    let mut made = MadeList::load(&root_canon);
+    forget_failures_in(&LocalStore::new(&root_canon), device_key, view, heics)
+}
+
+/// [`forget_failures`] over a store (the owner is checked in the store).
+pub fn forget_failures_in(
+    store: &dyn BackupStore,
+    device_key: &str,
+    view: Option<View>,
+    heics: Option<&[String]>,
+) -> Result<usize, SyncError> {
+    owned_in(store, device_key, view)?;
+    let mut made = MadeList::load_in(store);
     if let Some(why) = &made.save_blocked {
         return Err(SyncError::Io(why.clone()));
     }
@@ -638,7 +724,7 @@ pub fn forget_failures(
         Some(list) => list.iter().filter(|h| made.clear_failed(h)).count(),
     };
     if n > 0 {
-        made.save(&root_canon)
+        made.save_in(store)
             .map_err(|e| SyncError::Io(format!("could not save the list of JPG copies: {e}")))?;
     }
     info!(
@@ -665,7 +751,43 @@ pub fn retry_failures(
         return Ok(report);
     }
     let root_canon = owned_root(root, device_key, view)?;
-    let mut made = MadeList::load(&root_canon);
+    retry_in(
+        &LocalStore::new(&root_canon),
+        Some(&root_canon),
+        heics,
+        cancel,
+        on_event,
+    )
+}
+
+/// [`retry_failures`] over a store: an object store's owner is checked there, and its HEICs are
+/// downloaded to be decoded.
+pub fn retry_failures_in(
+    store: &dyn BackupStore,
+    device_key: &str,
+    view: Option<View>,
+    heics: Option<&[String]>,
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(JpgEvent),
+) -> Result<JpgReport, SyncError> {
+    let mut report = JpgReport::default();
+    if let Err(hint) = heic::available() {
+        report.unavailable = Some(hint);
+        return Ok(report);
+    }
+    owned_in(store, device_key, view)?;
+    retry_in(store, None, heics, cancel, on_event)
+}
+
+fn retry_in(
+    store: &dyn BackupStore,
+    local_root: Option<&Path>,
+    heics: Option<&[String]>,
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(JpgEvent),
+) -> Result<JpgReport, SyncError> {
+    let mut report = JpgReport::default();
+    let mut made = MadeList::load_in(store);
     if let Some(why) = &made.save_blocked {
         return Err(SyncError::Io(format!("no JPG copies were made: {why}")));
     }
@@ -683,7 +805,7 @@ pub fn retry_failures(
             {
                 // The same test as the backfill's: a JPEG beside it that the app didn't make
                 // (`.jpeg`, another case, or the exact name) is the device's, so none is made.
-                if own_jpeg_beside(&root_canon, &made, &heic) {
+                if own_jpeg_beside(store, &made, &heic) {
                     debug!("No JPG for {heic}: a JPEG of the device's is beside it");
                     report.up_to_date += 1;
                     continue;
@@ -695,35 +817,60 @@ pub fn retry_failures(
     if !forgotten {
         return Ok(report);
     }
-    made.save(&root_canon)
+    made.save_in(store)
         .map_err(|e| SyncError::Io(format!("could not save the list of JPG copies: {e}")))?;
     if candidates.is_empty() {
         return Ok(report);
     }
-    let work = sort_out(&root_canon, &mut made, candidates, &mut report, on_event);
-    make_all(&root_canon, &mut made, work, cancel, &mut report, on_event);
+    let work = sort_out(store, &mut made, candidates, &mut report, on_event);
+    make_all(
+        store,
+        local_root,
+        &mut made,
+        work,
+        cancel,
+        &mut report,
+        on_event,
+    );
     Ok(report)
 }
 
 /// Whether a JPEG the app did not make is beside the HEIC `heic` in the backup, with the same name
 /// but for the extension and its case ([`stem_key`]): the device's own, so no JPG is made. Looks
 /// only at the HEIC's folder.
-fn own_jpeg_beside(root_canon: &Path, made: &MadeList, heic: &SafeRelPath) -> bool {
+fn own_jpeg_beside(store: &dyn BackupStore, made: &MadeList, heic: &SafeRelPath) -> bool {
     let parts: Vec<&str> = heic.components().collect();
     let key = stem_key(&parts);
-    let Some(folder) = heic.under(root_canon).parent().map(Path::to_path_buf) else {
-        return false;
-    };
-    let Ok(dir) = fs::read_dir(folder) else {
-        return false;
-    };
     let folder_parts = &parts[..parts.len() - 1];
-    dir.flatten().any(|e| {
-        let name = e.file_name();
-        let Some(name) = name.to_str() else {
+    let folder = folder_parts.join("/");
+    // Folders, as the store names them: compared without regard to case where the file system
+    // does not tell them apart.
+    let same = |a: &str, b: &str| {
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    // Only the HEIC's folder, and the folders above it that the walk has to pass through.
+    let skip_folder = |dir: &str| {
+        let on_the_way = folder
+            .get(..dir.len())
+            .is_some_and(|head| same(head, dir) && folder[dir.len()..].starts_with('/'));
+        !(same(dir, &folder) || on_the_way)
+    };
+    let Ok(listing) = store.list(&skip_folder) else {
+        return false;
+    };
+    listing.files.iter().any(|f| {
+        if f.kind != Kind::File {
             return false;
+        }
+        let (dir, name) = match f.rel.rsplit_once('/') {
+            Some((d, n)) => (d, n),
+            None => ("", f.rel.as_str()),
         };
-        if !heic::is_jpeg_name(name) || !e.file_type().is_ok_and(|t| t.is_file()) {
+        if !same(dir, &folder) || !heic::is_jpeg_name(name) {
             return false;
         }
         let mut p = folder_parts.to_vec();
@@ -740,7 +887,17 @@ fn owned_root(root: &Path, device_key: &str, view: Option<View>) -> Result<PathB
             root.display()
         ))
     })?;
-    match owner::read(&root_canon) {
+    owned_in(&LocalStore::new(&root_canon), device_key, view)?;
+    Ok(root_canon)
+}
+
+/// Fails unless the store holds a marker saying it is this device's.
+fn owned_in(
+    store: &dyn BackupStore,
+    device_key: &str,
+    view: Option<View>,
+) -> Result<(), SyncError> {
+    match owner::read_in(store) {
         OwnerState::Owned(o) => {
             let why = match view {
                 Some(v) => owner::refusal(&o, device_key, v),
@@ -753,7 +910,7 @@ fn owned_root(root: &Path, device_key: &str, view: Option<View>) -> Result<PathB
             };
             match why {
                 Some(why) => Err(SyncError::WrongFolder(why)),
-                None => Ok(root_canon),
+                None => Ok(()),
             }
         }
         OwnerState::Unclaimed => Err(SyncError::WrongFolder(
@@ -790,16 +947,58 @@ pub fn backfill(
         return Ok(report);
     }
     let root_canon = owned_root(root, device_key, view)?;
-    let mut made = MadeList::load(&root_canon);
+    backfill_in_store(
+        &LocalStore::new(&root_canon),
+        Some(&root_canon),
+        archive_name,
+        ignore,
+        cancel,
+        on_event,
+    )
+}
+
+/// [`backfill`] over a store: an object store's owner is checked there, and its HEICs are
+/// downloaded one by one to be decoded.
+pub fn backfill_in(
+    store: &dyn BackupStore,
+    device_key: &str,
+    view: Option<View>,
+    archive_name: &str,
+    ignore: &[String],
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(JpgEvent),
+) -> Result<JpgReport, SyncError> {
+    let mut report = JpgReport::default();
+    if let Err(hint) = heic::available() {
+        report.unavailable = Some(hint);
+        return Ok(report);
+    }
+    owned_in(store, device_key, view)?;
+    backfill_in_store(store, None, archive_name, ignore, cancel, on_event)
+}
+
+fn backfill_in_store(
+    store: &dyn BackupStore,
+    local_root: Option<&Path>,
+    archive_name: &str,
+    ignore: &[String],
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(JpgEvent),
+) -> Result<JpgReport, SyncError> {
+    let mut report = JpgReport::default();
+    let mut made = MadeList::load_in(store);
     if let Some(why) = &made.save_blocked {
         return Err(SyncError::Io(format!("no JPG copies were made: {why}")));
     }
-    let Ok(index) = plan::index_backup(&root_canon, archive_name, ignore, cancel, &mut |_| {})
-    else {
-        // Stopped while looking: nothing was made, which is a Stop and not an error.
-        info!("Making JPG copies stopped (Stop) before any was made");
-        report.cancelled = true;
-        return Ok(report);
+    let index = match plan::index_backup_in(store, archive_name, ignore, cancel, &mut |_| {}) {
+        Ok(i) => i,
+        Err(plan::IndexStop::Failed(why)) => return Err(SyncError::Io(why)),
+        Err(plan::IndexStop::Cancelled) => {
+            // Stopped while looking: nothing was made, which is a Stop and not an error.
+            info!("Making JPG copies stopped (Stop) before any was made");
+            report.cancelled = true;
+            return Ok(report);
+        }
     };
     let mut heics: Vec<&plan::IndexedFile> = index
         .files()
@@ -831,8 +1030,16 @@ pub fn backfill(
         }
         candidates.push((heic, jpg));
     }
-    let work = sort_out(&root_canon, &mut made, candidates, &mut report, on_event);
-    make_all(&root_canon, &mut made, work, cancel, &mut report, on_event);
+    let work = sort_out(store, &mut made, candidates, &mut report, on_event);
+    make_all(
+        store,
+        local_root,
+        &mut made,
+        work,
+        cancel,
+        &mut report,
+        on_event,
+    );
     Ok(report)
 }
 

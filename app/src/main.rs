@@ -10,6 +10,7 @@ mod log_view;
 mod logging;
 mod questions;
 mod queue;
+mod s3;
 mod theme;
 mod validate;
 mod worker;
@@ -22,8 +23,9 @@ use pnk_core::state::{InstanceLock, StateDir, default_state_dir};
 
 const TITLE: &str = "Plug-n-Keep";
 
-/// Command-line options. Only debug builds with the `fake-device` feature accept any.
-#[derive(Default)]
+/// Command-line options. Every build accepts `--state-dir`; only debug builds with the
+/// `fake-device` feature accept the rest.
+#[derive(Debug, Default)]
 pub struct Options {
     /// Serve this folder as if it were a phone.
     pub fake_device: Option<PathBuf>,
@@ -33,37 +35,42 @@ pub struct Options {
     pub fake_lag: bool,
     /// Name the fake device after its folder (for screenshots).
     pub fake_named: bool,
-    /// Use this folder instead of the usual settings folder for skip lists and settings.
+    /// Use this folder instead of the usual settings folder (Local mode's state; S3 mode's is
+    /// the `s3` folder inside it).
     pub state_dir: Option<PathBuf>,
 }
 
-#[cfg(all(debug_assertions, feature = "fake-device"))]
-fn parse_args() -> Result<Options, String> {
+/// The command line, as `args` (without the program name). `--state-dir <folder>` is always
+/// accepted; the `--fake-*` options only when `with_fake` (debug builds with the `fake-device`
+/// feature). Anything else is an error.
+fn parse_options(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    with_fake: bool,
+) -> Result<Options, String> {
     let mut opts = Options::default();
-    let mut args = std::env::args_os().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
-            Some("--fake-device") => {
-                opts.fake_device = Some(args.next().ok_or("--fake-device needs a folder")?.into())
-            }
-            Some("--fake-slow") => opts.fake_slow = true,
-            Some("--fake-lag") => opts.fake_lag = true,
-            Some("--fake-named") => opts.fake_named = true,
             Some("--state-dir") => {
                 opts.state_dir = Some(args.next().ok_or("--state-dir needs a folder")?.into())
             }
+            Some("--fake-device") if with_fake => {
+                opts.fake_device = Some(args.next().ok_or("--fake-device needs a folder")?.into())
+            }
+            Some("--fake-slow") if with_fake => opts.fake_slow = true,
+            Some("--fake-lag") if with_fake => opts.fake_lag = true,
+            Some("--fake-named") if with_fake => opts.fake_named = true,
             _ => return Err(format!("Unknown option: {}", arg.to_string_lossy())),
         }
     }
     Ok(opts)
 }
 
-#[cfg(not(all(debug_assertions, feature = "fake-device")))]
 fn parse_args() -> Result<Options, String> {
-    match std::env::args_os().nth(1) {
-        Some(arg) => Err(format!("Unknown option: {}", arg.to_string_lossy())),
-        None => Ok(Options::default()),
-    }
+    parse_options(
+        std::env::args_os().skip(1),
+        cfg!(all(debug_assertions, feature = "fake-device")),
+    )
 }
 
 /// Show an error box and exit. There is no console in release builds.
@@ -121,6 +128,12 @@ fn main() {
             dir.display()
         ))
     });
+    let s3_state = StateDir::open(pnk_core::modes::s3_dir(&dir)).unwrap_or_else(|e| {
+        fail(&format!(
+            "Could not open the S3 settings folder inside {}: {e}",
+            dir.display()
+        ))
+    });
     // Held until the window closes: a second copy would fight over the device and the files.
     let _lock = match InstanceLock::acquire(&state) {
         Ok(Some(lock)) => lock,
@@ -154,7 +167,7 @@ fn main() {
     let result = eframe::run_native(
         TITLE,
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, state, opts, logger)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, state, s3_state, opts, logger)))),
     );
     if let Err(e) = result {
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -170,4 +183,37 @@ The graphics driver couldn't start; running                  `env -u WAYLAND_DIS
         fail(&format!("Could not open the window: {e}"));
     }
     log::info!("The window was closed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<std::ffi::OsString> {
+        a.iter().map(Into::into).collect()
+    }
+
+    #[test]
+    fn state_dir_is_accepted_in_every_build_and_the_rest_only_with_fake_device() {
+        for with_fake in [false, true] {
+            let o = parse_options(args(&["--state-dir", "C:/x"]), with_fake).unwrap();
+            assert_eq!(o.state_dir, Some(PathBuf::from("C:/x")));
+            assert!(parse_options(args(&["--state-dir"]), with_fake).is_err());
+            let e = parse_options(args(&["--bogus"]), with_fake).unwrap_err();
+            assert!(e.starts_with("Unknown option: --bogus"), "{e}");
+        }
+        assert!(parse_options(args(&[]), false).unwrap().state_dir.is_none());
+        // The fake-device options are refused in a release build, taken in a debug one.
+        for o in ["--fake-slow", "--fake-lag", "--fake-named"] {
+            assert!(parse_options(args(&[o]), false).is_err(), "{o}");
+            assert!(parse_options(args(&[o]), true).is_ok(), "{o}");
+        }
+        assert!(parse_options(args(&["--fake-device", "C:/p"]), false).is_err());
+        let o = parse_options(
+            args(&["--fake-device", "C:/p", "--state-dir", "D:/s"]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(o.fake_device, Some(PathBuf::from("C:/p")));
+    }
 }

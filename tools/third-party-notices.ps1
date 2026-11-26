@@ -143,6 +143,8 @@ $sources = [ordered]@{
     'BSD-3-Clause'   = @{ Crate = 'moxcms'; File = 'LICENSE.md' }
     'ISC'            = @{ Crate = 'libloading'; File = 'LICENSE' }
     'BSL-1.0'        = @{ Crate = 'error-code'; File = 'LICENSE' }
+    'BSD-2-Clause'   = @{ Crate = 'rusty-s3'; File = 'LICENSE' }
+    'CDLA-Permissive-2.0' = @{ Crate = 'webpki-roots'; File = 'LICENSE' }
     'Unicode-3.0'    = @{ Crate = 'unicode-ident'; File = 'LICENSE-UNICODE' }
     'OFL-1.1'        = @{ Crate = 'epaint_default_fonts'; File = 'fonts\OFL.txt'; Note = 'Applies to the Noto fonts egui ships.' }
     'Ubuntu-font-1.0' = @{ Crate = 'epaint_default_fonts'; File = 'fonts\UFL.txt'; Note = 'Applies to the Ubuntu font egui ships.' }

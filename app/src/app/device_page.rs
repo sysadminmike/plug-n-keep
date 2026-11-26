@@ -1,6 +1,7 @@
 //! The top bar, and the chosen device's page: how it was recognised, its backup folder, the last
 //! sync, the Scan and Start sync buttons and the tabs.
 
+use pnk_core::modes::Mode;
 use pnk_core::owner::{self, OwnerState};
 use pnk_core::signals::{DeviceKind, View};
 
@@ -84,6 +85,12 @@ pub(super) fn eject_button(
     (kind == DeviceKind::Storage && connected && system_can_eject).then_some(idle)
 }
 
+/// Why the Local / S3 switch can't be clicked right now, or `None` when it can: the switch
+/// swaps the whole list of devices, so not while a scan, sync, archive, JPG job or eject runs.
+pub(super) fn mode_switch_block(idle: bool) -> Option<&'static str> {
+    (!idle).then_some("Not while something is being scanned, copied or ejected. Wait for it to finish, or stop it.")
+}
+
 /// What the window shows for the open device.
 enum Shown {
     Opening,
@@ -104,6 +111,8 @@ impl App {
                     .family(theme::semibold())
                     .color(theme::TEXT),
             );
+            ui.add_space(10.0);
+            self.mode_switch(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Always available, also while scanning or copying, to watch what happens.
                 let open = self.log_view.open;
@@ -136,7 +145,7 @@ impl App {
                 let settings = ui
                     .push_id(if on { "settings-open" } else { "settings-closed" }, |ui| {
                         theme::toggle(ui, on, theme::I_SETTINGS, "Settings")
-                            .on_hover_text("The backups folder, what new devices start with, the log level, Find my backups")
+                            .on_hover_text("This mode's settings: where backups go, what new devices start with, the log level, Find my backups")
                             .clicked()
                     })
                     .inner;
@@ -144,8 +153,7 @@ impl App {
                     if on {
                         self.global = None;
                     } else {
-                        self.global = Some(GlobalForm::new(&self.config, self.backups_root()));
-                        self.found = None;
+                        self.open_settings();
                     }
                 }
                 ui.add_space(2.0);
@@ -163,6 +171,49 @@ impl App {
             });
         });
         ui.add_space(8.0);
+    }
+
+    /// "Local | S3": two small buttons, the current mode filled in blue. Choosing the other
+    /// one swaps the whole list of devices (see [`App::switch_mode`]).
+    fn mode_switch(&mut self, ui: &mut egui::Ui) {
+        let block = mode_switch_block(self.idle());
+        let mut pick = None;
+        let shown = ui.add_enabled_ui(block.is_none(), |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for m in [Mode::Local, Mode::S3] {
+                let on = self.mode == m;
+                let text = RichText::new(m.label()).size(12.5).color(if on {
+                    egui::Color32::WHITE
+                } else {
+                    theme::WEAK
+                });
+                let button = egui::Button::new(text)
+                    .fill(if on {
+                        theme::ACCENT
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        if on { theme::ACCENT } else { theme::BORDER },
+                    ))
+                    .corner_radius(6)
+                    .min_size(egui::vec2(46.0, 22.0));
+                let tip = match m {
+                    Mode::Local => "Local mode: backups go to folders on this PC",
+                    Mode::S3 => "S3 mode: backups go to a bucket on an S3 server",
+                };
+                if ui.add(button).on_hover_text(tip).clicked() && !on {
+                    pick = Some(m);
+                }
+            }
+        });
+        if let Some(why) = block {
+            shown.response.on_disabled_hover_text(why);
+        }
+        if let Some(m) = pick {
+            self.switch_mode(m);
+        }
     }
 
     pub(super) fn banners(&mut self, ui: &mut egui::Ui) {
@@ -491,6 +542,13 @@ impl App {
     /// Whether the device's backup folder is there. A folder the first sync has not made yet is
     /// not "missing".
     pub(super) fn folder_state(&self, d: &KnownDevice) -> FolderState {
+        // A bucket's state is the worker's last look at it (not on every frame).
+        if d.s3.is_some() {
+            return self
+                .s3_states
+                .get(&d.id)
+                .map_or(FolderState::Checking, |(s, _)| *s);
+        }
         match self
             .folders
             .get(&d.id)
@@ -507,40 +565,82 @@ impl App {
     fn folder_row(&mut self, ui: &mut egui::Ui, d: &KnownDevice) {
         let idle = self.idle();
         let state = self.folder_state(d);
+        let bucket = d.s3.as_ref();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(RichText::new("Backs up to").color(theme::WEAK));
-            match &d.backup_dir {
-                Some(p) => {
+            if bucket.is_some() {
+                theme::pill(ui, "S3", theme::ACCENT);
+            }
+            let caution = state == FolderState::Missing || state.blocks();
+            match d.destination() {
+                Some(place) => {
                     ui.label(
-                        RichText::new(p.display().to_string())
+                        RichText::new(place.label().display().to_string())
                             .family(theme::semibold())
-                            .color(if state == FolderState::Missing {
-                                theme::CAUTION
-                            } else {
-                                theme::TEXT
-                            }),
+                            .color(if caution { theme::CAUTION } else { theme::TEXT }),
                     );
                 }
                 None => {
-                    ui.label(RichText::new("no folder chosen yet").color(theme::CAUTION));
+                    ui.label(RichText::new("no place chosen yet").color(theme::CAUTION));
                 }
             }
             if ui
                 .add_enabled(idle, egui::Button::new("Change…"))
-                .on_hover_text("Choose another backup folder for this device")
+                .on_hover_text(match self.mode {
+                    Mode::Local => "Choose another backup folder for this device",
+                    Mode::S3 => "Choose another folder in the bucket for this device",
+                })
                 .clicked()
             {
-                self.choose_backup_folder(d);
+                self.choose_backup_place(d);
             }
-            if state == FolderState::Present
-                && let Some(p) = &d.backup_dir
-                && ui.button("Open").on_hover_text("Show the folder").clicked()
-            {
-                self.open_backup_folder(p);
+            match (bucket, &d.backup_dir) {
+                (Some(c), _) => {
+                    if ui
+                        .button("Copy address")
+                        .on_hover_text("Copy the s3:// address of the backup")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(crate::s3::address(c));
+                        self.notice = Some("Copied the address of the backup.".into());
+                    }
+                }
+                (None, Some(p)) => {
+                    if state == FolderState::Present
+                        && ui.button("Open").on_hover_text("Show the folder").clicked()
+                    {
+                        self.open_backup_folder(p);
+                    }
+                }
+                (None, None) => {}
             }
         });
-        if state == FolderState::Missing {
+        if bucket.is_some()
+            && let Some((_, note)) = self.bucket.notes.iter().find(|(id, _)| *id == d.id)
+        {
+            ui.label(RichText::new(note).small().color(theme::CAUTION));
+        }
+        if let Some(c) = bucket {
+            let detail = self.s3_states.get(&d.id).map(|(_, t)| t.clone());
+            if state.blocks() {
+                let text = detail.unwrap_or_default();
+                if theme::warning(ui, &text, "Check again", idle) {
+                    self.s3_states
+                        .insert(d.id.clone(), (FolderState::Checking, String::new()));
+                    self.send(Command::CheckStores);
+                }
+            } else if state == FolderState::Missing {
+                let why = detail.filter(|t| !t.is_empty()).unwrap_or_default();
+                let text = format!(
+                    "Backup not found: {}. {why} Nothing can be backed up without it. Use Find it… if it was moved, or Change… to start a new backup place.",
+                    crate::s3::address(c)
+                );
+                if theme::warning(ui, &text, "Find it…", idle) {
+                    self.find_backup_place(d);
+                }
+            }
+        } else if state == FolderState::Missing {
             let folder = d
                 .backup_dir
                 .as_deref()
@@ -551,34 +651,6 @@ impl App {
             if theme::warning(ui, &text, "Find it…", idle) {
                 self.point_to_new_place(d);
             }
-        }
-    }
-
-    /// "Change…": any folder the user picks becomes the device's backup folder. The scan checks
-    /// whose it is.
-    fn choose_backup_folder(&mut self, d: &KnownDevice) {
-        let mut dialog = rfd::FileDialog::new().set_title("Choose the backup folder");
-        if let Some(dir) = d.backup_dir.as_deref().filter(|p| p.is_dir()) {
-            dialog = dialog.set_directory(dir);
-        } else if self.backups_root().is_dir() {
-            dialog = dialog.set_directory(self.backups_root());
-        }
-        let Some(dir) = dialog.pick_folder() else {
-            return;
-        };
-        let note = crate::validate::folder_note(&dir, Some(&d.id), &self.known);
-        if note.blocks() {
-            self.error = note.text();
-            return;
-        }
-        info!("Backup folder chosen for \"{}\": {}", d.name, dir.display());
-        self.clear_scan();
-        self.send(Command::SetBackupDir {
-            id: d.id.clone(),
-            dir,
-        });
-        if let Some(text) = note.text() {
-            self.notice = Some(text);
         }
     }
 
@@ -593,7 +665,7 @@ impl App {
         self.clear_scan();
         self.send(Command::Relocate {
             id: d.id.clone(),
-            dir,
+            dest: Destination::Local(dir),
         });
     }
 
@@ -647,7 +719,8 @@ impl App {
         ui.horizontal(|ui| {
             ui.push_id(scope, |ui| match &self.busy {
                 Busy::Idle => {
-                    let ready = d.backup_dir.is_some() && d.offline.is_none();
+                    let bucket_blocked = self.folder_state(d).blocks();
+                    let ready = d.destination().is_some() && d.offline.is_none() && !bucket_blocked;
                     if ui
                         .add_enabled(ready, egui::Button::new("Scan"))
                         .on_hover_text("Compare the device with the backup folder")
@@ -691,7 +764,9 @@ impl App {
                         .scan
                         .as_ref()
                         .is_some_and(|s| s.plan.folder_blocked().is_some());
-                    let can = (pending > 0 || to_archive > 0 || jpgs > 0) && !blocked;
+                    let can = (pending > 0 || to_archive > 0 || jpgs > 0)
+                        && !blocked
+                        && !bucket_blocked;
                     if theme::button(ui, can, theme::I_SYNC, &text, true)
                         .on_hover_text(
                             "Copy every pending file, and deal with files deleted from the device as this device's setting says",
@@ -709,7 +784,13 @@ impl App {
                         "What happens to files deleted from this device, and to the old copy of a changed file. \"{}\" is this device's archive folder. Nothing is ever deleted for good.",
                         d.settings.archive_name
                     );
-                    deleted_files_combo(ui, &mut mode, ("page-deleted", &d.id), Some(tip));
+                    deleted_files_combo(
+                        ui,
+                        &mut mode,
+                        ("page-deleted", &d.id),
+                        Some(tip),
+                        d.s3.is_some(),
+                    );
                     if mode != d.settings.deleted_files {
                         info!(
                             "Files deleted from \"{}\": {} chosen",
@@ -870,5 +951,12 @@ mod tests {
             claim_offer_for(&OwnerState::Unreadable("bad".into()), "me", WindowsWpd),
             Some(ClaimOffer::Offer(_))
         ));
+    }
+
+    #[test]
+    fn the_mode_switch_is_blocked_while_anything_runs_and_says_why() {
+        assert_eq!(mode_switch_block(true), None);
+        let why = mode_switch_block(false).unwrap();
+        assert!(why.contains("scanned") && why.contains("copied"));
     }
 }

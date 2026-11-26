@@ -133,6 +133,11 @@ impl App {
                     button,
                 )
             }
+            Confirm::RebuildCache(_) => (
+                "Rebuild the modified-time cache?".to_string(),
+                "The next scan reads every file's date again, then saves a fresh cache. Nothing is copied or deleted.".to_string(),
+                "Rebuild",
+            ),
             Confirm::ClaimFolder => {
                 let why = self
                     .scan
@@ -249,9 +254,11 @@ impl App {
                 Dialog::Forget { name, .. } => {
                     ui.heading(format!("Forget \"{name}\"?"));
                     ui.add_space(4.0);
-                    ui.label(
-                        "This only takes the device off the app's list. Its backup folder and everything in it, history included, stay where they are, and nothing on the device is touched. \"Add an existing backup…\" brings it back.",
-                    );
+                    ui.label(if self.mode == Mode::S3 {
+                        "This takes the device off the list on every PC that uses this bucket. Its folder in the bucket and everything in it, history included, stay where they are, and nothing on the device is touched. \"Add an existing backup…\" brings it back."
+                    } else {
+                        "This only takes the device off the app's list. Its backup folder and everything in it, history included, stay where they are, and nothing on the device is touched. \"Add an existing backup…\" brings it back."
+                    });
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.add(theme::primary("Forget")).clicked() {

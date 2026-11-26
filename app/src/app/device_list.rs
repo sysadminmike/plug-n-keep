@@ -17,6 +17,8 @@ pub(super) struct ListRow {
     /// The known device this is, if it is one (it has a menu).
     pub device_id: Option<String>,
     pub connected: bool,
+    /// Its backup is in a bucket: `s3://bucket/folder/`, for the tag and the hover.
+    pub bucket: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +80,10 @@ pub(super) fn build_rows(
             name,
             status,
             tone,
+            bucket: device_id
+                .as_deref()
+                .and_then(|id| known.iter().find(|k| k.id == id))
+                .and_then(|k| k.s3.as_ref().map(crate::s3::address)),
             device_id,
             connected: true,
         });
@@ -93,6 +99,7 @@ pub(super) fn build_rows(
             tone: Tone::Quiet,
             device_id: Some(k.id.clone()),
             connected: false,
+            bucket: k.s3.as_ref().map(crate::s3::address),
         });
     }
     rows
@@ -102,6 +109,8 @@ enum ListAction {
     Rename(String),
     Forget(String),
     OpenFolder(String),
+    /// A bucket device: copy its `s3://` address.
+    CopyAddress(String),
     WriteIdFile(String),
 }
 
@@ -122,12 +131,27 @@ fn open_folder(path: &Path) -> std::io::Result<()> {
 
 impl App {
     pub(super) fn device_list(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new("Devices")
-                .family(theme::semibold())
-                .color(theme::TEXT),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Devices")
+                    .family(theme::semibold())
+                    .color(theme::TEXT),
+            );
+            theme::pill(ui, self.mode.label(), theme::ACCENT);
+        });
         ui.add_space(6.0);
+        let s3_missing = self.mode == Mode::S3 && self.config.default_s3.is_none();
+        let mut to_settings = false;
+        if s3_missing {
+            ui.label(RichText::new(crate::app::place::NOT_SET_UP).color(theme::CAUTION));
+            if ui.button("Open Settings").clicked() {
+                to_settings = true;
+            }
+            ui.add_space(6.0);
+        }
+        if self.mode == Mode::S3 {
+            self.bucket_status_lines(ui);
+        }
         let rows = build_rows(&self.devices, &self.links, &self.known);
         let mut chosen: Option<Sel> = None;
         let mut action: Option<ListAction> = None;
@@ -136,6 +160,8 @@ impl App {
         if rows.is_empty() {
             let text = if self.listing {
                 "Looking for devices…"
+            } else if self.mode == Mode::S3 {
+                "No device is plugged in, and none is set up in S3 mode yet. Plug one in, or click Refresh."
             } else {
                 "No device is plugged in, and none is known yet. Plug one in, or click Refresh."
             };
@@ -174,12 +200,13 @@ impl App {
                 ui.add_space(8.0);
                 if ui
                     .add_enabled(
-                        idle,
+                        idle && !s3_missing,
                         egui::Button::new(RichText::new("Add an existing backup…").size(11.5)).small(),
                     )
-                    .on_hover_text(
-                        "Pick a backup folder, such as one copied from another PC. The device is set up again from the files in it.",
-                    )
+                    .on_hover_text(match self.mode {
+                        Mode::Local => "Pick a backup folder, such as a backup copied from another PC. The device is set up again from the files in it.",
+                        Mode::S3 => "Look in the base folder of the bucket again for devices, and bring back any that were forgotten.",
+                    })
                     .clicked()
                 {
                     add_backup = true;
@@ -194,26 +221,47 @@ impl App {
             None => {}
         }
         if let Some(a) = action {
-            self.list_action(a);
+            self.list_action(&ui.ctx().clone(), a);
         }
         if add_backup {
             self.add_existing_backup();
         }
+        if to_settings {
+            self.open_settings();
+        }
     }
 
-    /// "Add an existing backup…": the user picks a backup folder (or the folder that holds some),
-    /// and the worker adds the devices it finds from the files in it.
-    pub(super) fn add_existing_backup(&mut self) {
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Choose a backup folder, or the folder that holds backup folders");
-        if self.backups_root().is_dir() {
-            dialog = dialog.set_directory(self.backups_root());
-        }
-        let Some(dir) = dialog.pick_folder() else {
-            return;
+    /// S3 mode: what the list is (the bucket's, or what this PC last saw), and anything the look
+    /// in the bucket found that needs saying.
+    fn bucket_status_lines(&self, ui: &mut egui::Ui) {
+        use crate::worker::BucketStatus;
+        let small = |ui: &mut egui::Ui, text: String, color: Color32| {
+            ui.label(RichText::new(text).size(11.0).color(color));
         };
-        info!("Adding the existing backup in {}", dir.display());
-        self.send(Command::AddExisting { dir });
+        match &self.bucket.status {
+            BucketStatus::Looking => small(ui, "Looking in the bucket…".into(), theme::WEAK),
+            BucketStatus::Unavailable { state, detail } => {
+                let why = if detail.is_empty() {
+                    crate::worker::unavailable_text(*state)
+                } else {
+                    detail.clone()
+                };
+                small(
+                    ui,
+                    format!("{why} Showing the devices last seen."),
+                    theme::CAUTION,
+                );
+            }
+            BucketStatus::NotSet | BucketStatus::Ready => {}
+        }
+        for p in &self.bucket.problems {
+            small(ui, p.clone(), theme::CAUTION);
+        }
+        if !self.bucket.problems.is_empty()
+            || matches!(self.bucket.status, BucketStatus::Unavailable { .. })
+        {
+            ui.add_space(4.0);
+        }
     }
 
     /// One row. Returns whether it was clicked, and a menu choice.
@@ -227,6 +275,10 @@ impl App {
         let width = ui.available_width().min(216.0);
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 40.0), egui::Sense::click());
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let resp = match &row.bucket {
+            Some(address) => resp.on_hover_text(format!("S3: {address}")),
+            None => resp,
+        };
         let painter = ui.painter();
         if selected {
             painter.rect(
@@ -272,6 +324,19 @@ impl App {
             if grey { theme::FAINT } else { theme::WEAK },
         );
         painter.galley(egui::pos2(text_left, rect.top() + 4.0), name, theme::TEXT);
+        if row.bucket.is_some() {
+            // A small tag at the right of the name line, left of the menu button.
+            let tag = painter.layout_no_wrap(
+                "S3".to_string(),
+                egui::FontId::proportional(10.0),
+                theme::ACCENT,
+            );
+            painter.galley(
+                egui::pos2(rect.right() - 38.0 - tag.size().x, rect.top() + 6.0),
+                tag,
+                theme::ACCENT,
+            );
+        }
         painter.galley(
             egui::pos2(text_left, rect.top() + 21.0),
             status,
@@ -286,13 +351,21 @@ impl App {
                 *action = Some(ListAction::Rename(id.clone()));
                 ui.close();
             }
-            let folder = device.and_then(|d| d.backup_dir.clone());
-            if ui
-                .add_enabled(folder.is_some(), egui::Button::new("Open backup folder"))
-                .clicked()
-            {
-                *action = Some(ListAction::OpenFolder(id.clone()));
-                ui.close();
+            if row.bucket.is_some() {
+                // A bucket has no folder to open: its address can be copied.
+                if ui.button("Copy address").clicked() {
+                    *action = Some(ListAction::CopyAddress(id.clone()));
+                    ui.close();
+                }
+            } else {
+                let folder = device.and_then(|d| d.backup_dir.clone());
+                if ui
+                    .add_enabled(folder.is_some(), egui::Button::new("Open backup folder"))
+                    .clicked()
+                {
+                    *action = Some(ListAction::OpenFolder(id.clone()));
+                    ui.close();
+                }
             }
             let can_id = row.connected
                 && self.current_is(&row.sel)
@@ -330,7 +403,7 @@ impl App {
                     menu(ui, &mut action)
                 })
                 .response
-                .on_hover_text("Rename, forget, open the backup folder");
+                .on_hover_text("Rename, forget, open the backup folder or copy its address");
             });
         }
         (resp.clicked() && idle, action)
@@ -347,7 +420,7 @@ impl App {
             if o.is_volume && matches!(o.id_file, IdFile::Missing) && matches!(o.stage, Stage::Ready { .. }))
     }
 
-    fn list_action(&mut self, action: ListAction) {
+    fn list_action(&mut self, ctx: &egui::Context, action: ListAction) {
         match action {
             ListAction::Rename(id) => {
                 if let Some(d) = self.known_by_id(&id) {
@@ -368,6 +441,12 @@ impl App {
             ListAction::OpenFolder(id) => {
                 if let Some(dir) = self.known_by_id(&id).and_then(|d| d.backup_dir.clone()) {
                     self.open_backup_folder(&dir);
+                }
+            }
+            ListAction::CopyAddress(id) => {
+                if let Some(c) = self.known_by_id(&id).and_then(|d| d.s3.as_ref()) {
+                    ctx.copy_text(crate::s3::address(c));
+                    self.notice = Some("Copied the address of the backup.".into());
                 }
             }
             ListAction::WriteIdFile(id) => {

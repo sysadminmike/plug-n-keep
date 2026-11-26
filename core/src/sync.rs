@@ -19,12 +19,12 @@
 //! - a crash leaves a record that the next start uses to clean up, without skipping.
 #![forbid(unsafe_code)]
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use log::{debug, error, info, warn};
 
@@ -32,12 +32,14 @@ use crate::counted;
 use crate::device::{DeviceSource, ObjectInfo};
 use crate::heic::made::{MadeEntry, MadeList};
 use crate::owner::{self, FolderOwner, OwnerState};
-use crate::paths::{SafeRelPath, TEMP_SUFFIX, is_link, prepare_parent};
+use crate::paths::{SafeRelPath, is_link, prepare_parent};
 use crate::plan::{MAX_NUMBERED, MadeJpg, PlanEntry, Removed, ScanPlan, Status};
 use crate::platform;
 use crate::registry::{ArchiveLayout, DeletedFiles};
 use crate::space::{self, ShortOfSpace};
 use crate::state::{InProgress, OldCopyGoes, ReplaceStep, Scope, StateDir};
+use crate::store::mtimes::{self, Uploaded};
+use crate::store::{BackupStore, Kind as StoreKind, LocalStore, Upload, Watched, explain};
 
 const BUFFER: usize = 256 * 1024;
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
@@ -179,6 +181,10 @@ pub struct SyncReport {
     /// A file failed because the connection to the device was lost (the error that says it is
     /// kept here), so the sync stopped there: nothing more can be read from this session.
     pub connection_lost: Option<String>,
+    /// The backup could not be reached (the message says "No network: ..."), so the sync stopped
+    /// there. The file being copied, if any, was thrown away or is named in the crash record for
+    /// the next start; nothing already copied was touched.
+    pub offline: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +205,8 @@ pub enum SyncError {
     /// The files to copy won't fit on the backup disk with the margin ([`crate::space`]); nothing
     /// was copied.
     NotEnoughSpace(ShortOfSpace),
+    /// The backup could not be reached ("No network: can't reach ..."); nothing was done.
+    Offline(String),
     Io(String),
 }
 
@@ -224,6 +232,7 @@ impl std::fmt::Display for SyncError {
                 why.join("; ")
             ),
             SyncError::NotEnoughSpace(short) => write!(f, "{short} Nothing was copied."),
+            SyncError::Offline(why) => write!(f, "{why}; nothing was changed"),
             SyncError::Io(m) => write!(f, "{m}"),
         }
     }
@@ -249,6 +258,34 @@ pub fn run_sync(
     confirmed: bool,
     on_event: &mut dyn FnMut(SyncEvent),
 ) -> Result<SyncReport, SyncError> {
+    run_sync_in(
+        &LocalStore::new(&plan.root),
+        source,
+        plan,
+        items,
+        state,
+        ctl,
+        stamp,
+        confirmed,
+        on_event,
+    )
+}
+
+/// [`run_sync`] into any [`BackupStore`]. The owner marker, the made list and the skip list are
+/// read and written in the store. If the store can't be reached the sync stops there
+/// ([`SyncReport::offline`], or [`SyncError::Offline`] before anything was done).
+#[allow(clippy::too_many_arguments)]
+pub fn run_sync_in(
+    store: &dyn BackupStore,
+    source: &mut dyn DeviceSource,
+    plan: &ScanPlan,
+    items: &[SyncItem],
+    state: &StateDir,
+    ctl: &SyncControl,
+    stamp: &str,
+    confirmed: bool,
+    on_event: &mut dyn FnMut(SyncEvent),
+) -> Result<SyncReport, SyncError> {
     let connected = source.identity().key.clone();
     if connected != plan.device_key {
         warn!(
@@ -264,28 +301,34 @@ pub fn run_sync(
         "Sync started: {} from {} into {}",
         counted(items.len(), "file", "files"),
         plan.device_label,
-        plan.root.display()
+        store.describe()
     );
-    fs::create_dir_all(&plan.root).map_err(|e| {
+    let watched = Watched::new(store);
+    let store: &dyn BackupStore = &watched;
+    store.ensure_root().map_err(|e| {
         error!(
             "Could not create the backup folder {}: {e}",
-            plan.root.display()
+            store.describe()
         );
+        if crate::store::is_offline(&e) {
+            return SyncError::Offline(explain(&e));
+        }
         SyncError::Io(format!(
-            "could not create the backup folder {}: {e}",
-            plan.root.display()
+            "could not create the backup folder {}: {}",
+            store.describe(),
+            explain(&e)
         ))
     })?;
-    let root_canon = checked_root(plan)?;
+    check_root(store, plan)?;
     // A backup folder belongs to one device: never copy one device's files into another's.
-    check_owner(plan, &root_canon)?;
+    check_owner_in(store, plan)?;
     // Will it fit? Refused before anything is written, with the margin kept free.
-    check_space(plan, items, &root_canon)?;
+    check_space(plan, items, store)?;
     // The first sync into a folder records which device it belongs to (see `owner`), and every
     // sync records the archive name it uses. If that can't be written, new files are still
     // copied, but nothing is moved into an archive: the marker must list the name first, or a
     // later scan could take the archive for backup files.
-    let archive_ready = match record_archive_name(plan, &root_canon, confirmed) {
+    let archive_ready = match record_archive_name(plan, store, confirmed) {
         Ok(()) => Ok(()),
         Err(e) => {
             warn!("{e}; copying new files anyway, but no file is moved into the archive");
@@ -300,17 +343,19 @@ pub fn run_sync(
     // The device has a JPG of its own where the app made one, and the backup already holds that
     // very file: it is the device's now, so the list stops calling it the app's.
     forget_made(
-        &root_canon,
+        store,
         plan.entries
             .iter()
             .filter(|e| e.made_jpg && e.status == Status::Verified)
             .map(|e| e.target.as_str()),
     );
-    let scope = Scope::new(&plan.device_key, &plan.root);
+    let scope = Scope::in_store(&plan.device_key, store, &plan.root);
     let mut report = SyncReport::default();
     let started = Instant::now();
     let mut copied_bytes: u64 = 0;
     let mut landed_on_jpeg: Vec<String> = Vec::new();
+    // The modified-time cache of an object store: this sync's uploads go in, saved at the end.
+    let mut cache = mtimes::Session::start(store, plan.mtime_cache.as_ref());
 
     for (ordinal, item) in items.iter().enumerate() {
         if ctl.cancel.load(Ordering::Relaxed) {
@@ -351,8 +396,8 @@ pub fn run_sync(
         });
         let file_started = Instant::now();
         let ctx = FileCtx {
+            store,
             root: &plan.root,
-            root_canon: &root_canon,
             device: &plan.device_key,
             index: item.entry,
             entry,
@@ -364,7 +409,8 @@ pub fn run_sync(
         };
         let mut unfinished = false;
         match copy_one(source, &ctx, state, ctl, on_event, &mut unfinished) {
-            Outcome::Copied(target, bytes, old_copy) => {
+            Outcome::Copied(target, bytes, old_copy, made) => {
+                cache.uploaded(target.as_str(), bytes, made);
                 let secs = file_started.elapsed().as_secs_f64();
                 copied_bytes += bytes;
                 let as_name = if target == entry.source {
@@ -404,7 +450,7 @@ pub fn run_sync(
                     target,
                 });
             }
-            Outcome::Skipped => match state.skip_add(&scope, &entry.source) {
+            Outcome::Skipped => match state.skip_add_in(&scope, store, &entry.source) {
                 Ok(()) => {
                     warn!("Skipped {} part-way (Skip current)", entry.source);
                     report.skipped += 1;
@@ -460,12 +506,27 @@ pub fn run_sync(
             source.spoil();
             report.must_reconnect = true;
         }
-        if unfinished || report.cancelled || report.disk_full || report.connection_lost.is_some() {
+        if let Some(why) = watched.offline() {
+            warn!("The backup could not be reached, so the sync stops here: {why}");
+            report.offline = Some(why);
+        }
+        if report.offline.is_none() {
+            cache.checkpoint(store);
+        }
+        if unfinished
+            || report.cancelled
+            || report.disk_full
+            || report.connection_lost.is_some()
+            || report.offline.is_some()
+        {
             break;
         }
     }
     report.copied_bytes = copied_bytes;
-    forget_made(&root_canon, landed_on_jpeg.iter().map(String::as_str));
+    if report.offline.is_none() {
+        cache.finish(store);
+        forget_made(store, landed_on_jpeg.iter().map(String::as_str));
+    }
     let r = &report;
     info!(
         "Copying finished in {:.1} s: {} copied ({}), {} already backed up, {} skipped, {} failed{}{}{}",
@@ -494,9 +555,13 @@ pub fn run_sync(
 /// won't fit on the backup disk ([`crate::space`]). Moves into the archive, beside the new copy or into the bin stay on the
 /// same disk and need nothing extra. If the disk can't be asked, the sync goes ahead: the
 /// disk-full stop is the backstop.
-fn check_space(plan: &ScanPlan, items: &[SyncItem], root_canon: &Path) -> Result<(), SyncError> {
+fn check_space(
+    plan: &ScanPlan,
+    items: &[SyncItem],
+    store: &dyn BackupStore,
+) -> Result<(), SyncError> {
     let needed = space::bytes_to_write(plan, items).saturating_add(space::jpg_bytes(plan));
-    let disk = platform::disk_space(root_canon);
+    let disk = store.space();
     match &disk {
         Some(d) => info!(
             "This sync writes {}; the backup disk has {} free of {}",
@@ -543,17 +608,17 @@ pub(crate) fn is_disk_full_for_tests(e: &io::Error) -> bool {
 
 /// Write one chunk of a copy. Tests can make the disk "fill up" after so many bytes
 /// (`fail_writes_after`), by writing what fits and then failing as a full disk does.
-fn write_chunk(out: &mut File, chunk: &[u8], written_before: u64) -> io::Result<()> {
+fn write_chunk(out: &mut dyn Upload, chunk: &[u8], written_before: u64) -> io::Result<()> {
     #[cfg(test)]
     if let Some(limit) = FAIL_WRITES_AFTER.with(std::cell::Cell::get)
         && written_before + chunk.len() as u64 > limit
     {
         let room = limit.saturating_sub(written_before) as usize;
-        out.write_all(&chunk[..room])?;
+        out.write(&chunk[..room])?;
         return Err(io::Error::from_raw_os_error(DISK_FULL_CODE));
     }
     let _ = written_before;
-    out.write_all(chunk)
+    out.write(chunk)
 }
 
 #[cfg(test)]
@@ -611,6 +676,17 @@ fn rate(bytes: u64, secs: f64) -> String {
     }
 }
 
+/// The folder the app's own state files (owner marker, made list) are read and written in: the
+/// backup folder resolved, provided it still resolves to where it did at scan time. Only a folder
+/// on this PC can be resolved; for any other store it is the plan's path as it is.
+pub(crate) fn owner_root(store: &dyn BackupStore, plan: &ScanPlan) -> Result<PathBuf, SyncError> {
+    if store.as_local().is_some() {
+        checked_root(plan)
+    } else {
+        Ok(plan.root.clone())
+    }
+}
+
 /// The backup folder, resolved, provided it still resolves to where it did at scan time.
 pub(crate) fn checked_root(plan: &ScanPlan) -> Result<PathBuf, SyncError> {
     let root_canon = fs::canonicalize(&plan.root).map_err(|e| {
@@ -639,12 +715,26 @@ pub(crate) fn checked_root(plan: &ScanPlan) -> Result<PathBuf, SyncError> {
     Ok(root_canon)
 }
 
-/// Refuse if the folder belonged to another device at scan time, or does now (another device
-/// may have claimed it since), or if its owner marker can't be read.
+/// For a folder on this PC: it still resolves to where it did at scan time. Nothing to check for
+/// any other store.
+fn check_root(store: &dyn BackupStore, plan: &ScanPlan) -> Result<(), SyncError> {
+    if store.as_local().is_some() {
+        checked_root(plan)?;
+    }
+    Ok(())
+}
+
+/// [`check_owner_in`] for the folder `root_canon`.
 pub(crate) fn check_owner(plan: &ScanPlan, root_canon: &Path) -> Result<(), SyncError> {
+    check_owner_in(&LocalStore::new(root_canon), plan)
+}
+
+/// Refuse if the backup belonged to another device at scan time, or does now (another device
+/// may have claimed it since), or if its owner marker can't be read.
+pub(crate) fn check_owner_in(store: &dyn BackupStore, plan: &ScanPlan) -> Result<(), SyncError> {
     let why = match plan.folder_blocked() {
         Some(why) => why,
-        None => match owner::read(root_canon) {
+        None => match owner::read_in(store) {
             OwnerState::Owned(o) => match owner::refusal(&o, &plan.device_key, plan.view) {
                 Some(why) => why,
                 None => return Ok(()),
@@ -683,6 +773,9 @@ pub struct ArchiveReport {
     pub held: usize,
     /// JPG copies moved along with their HEICs, to the same place. Not counted in `moved`.
     pub jpgs_moved: usize,
+    /// The backup could not be reached ("No network: ..."), so archiving stopped there; the files
+    /// not yet moved were left where they are.
+    pub offline: Option<String>,
 }
 
 /// A name for this sync's archive folder: the local date and time, e.g. `2026-11-16 15-30-05`.
@@ -697,11 +790,19 @@ pub fn archive_stamp() -> String {
 /// A first marker is written without replacing anything. If the folder already held files, the
 /// marker records that they have not been confirmed yet (unless `confirmed`), so a sync that
 /// leaves them alone doesn't make the next scan forget to ask.
-fn record_archive_name(plan: &ScanPlan, root_canon: &Path, confirmed: bool) -> Result<(), String> {
+fn record_archive_name(
+    plan: &ScanPlan,
+    store: &dyn BackupStore,
+    confirmed: bool,
+) -> Result<(), String> {
     owner::validate_archive_name(&plan.archive_name)?;
-    let write_failed =
-        |e: io::Error| format!("could not record the backup folder's owner and archive name ({e})");
-    match owner::read(root_canon) {
+    let write_failed = |e: io::Error| {
+        format!(
+            "could not record the backup folder's owner and archive name ({})",
+            explain(&e)
+        )
+    };
+    match owner::read_in(store) {
         OwnerState::Unclaimed => {
             let mut marker = FolderOwner::new(
                 &plan.device_key,
@@ -712,7 +813,7 @@ fn record_archive_name(plan: &ScanPlan, root_canon: &Path, confirmed: bool) -> R
             )
             .with_archive_name(&plan.archive_name);
             marker.foreign_unconfirmed = plan.backup_files > 0 && !confirmed;
-            owner::write_new(root_canon, &marker).map_err(write_failed)
+            owner::write_new_in(store, &marker).map_err(write_failed)
         }
         OwnerState::Owned(mut o) => {
             if o.has_archive_name(&plan.archive_name) {
@@ -723,7 +824,7 @@ fn record_archive_name(plan: &ScanPlan, root_canon: &Path, confirmed: bool) -> R
                 plan.archive_name, o.archive_names
             );
             o.use_archive_name(&plan.archive_name);
-            owner::write(root_canon, &o).map_err(write_failed)
+            owner::write_in(store, &o).map_err(write_failed)
         }
         OwnerState::Unreadable(e) => Err(format!(
             "{} in the backup folder can't be read ({e})",
@@ -754,6 +855,30 @@ pub fn archive_removed(
     confirmed: bool,
     on_event: &mut dyn FnMut(ArchiveEvent),
 ) -> Result<ArchiveReport, SyncError> {
+    archive_removed_in(
+        &LocalStore::new(&plan.root),
+        plan,
+        stamp,
+        confirmed,
+        None,
+        on_event,
+    )
+}
+
+/// [`archive_removed`] in any [`BackupStore`]. If the store can't be reached it stops there
+/// ([`ArchiveReport::offline`], or [`SyncError::Offline`] before anything was moved).
+///
+/// With `state`, a store without folders (where a move is a copy and then a delete) gets a
+/// crash record around each move, so a stop between the two is cleaned up at the next start
+/// ([`StateDir::recover_interrupted_for`]).
+pub fn archive_removed_in(
+    store: &dyn BackupStore,
+    plan: &ScanPlan,
+    stamp: &str,
+    confirmed: bool,
+    state: Option<&StateDir>,
+    on_event: &mut dyn FnMut(ArchiveEvent),
+) -> Result<ArchiveReport, SyncError> {
     let mode = plan.deleted_files;
     let mut report = ArchiveReport {
         mode,
@@ -769,8 +894,31 @@ pub fn archive_removed(
         );
         return Ok(report);
     }
-    let root_canon = checked_root(plan)?;
-    check_owner(plan, &root_canon)?;
+    if mode == DeletedFiles::RecycleBin && !store.supports_bin() {
+        return Err(SyncError::Io(format!(
+            "{BIN_UNAVAILABLE}; nothing was moved"
+        )));
+    }
+    let watched = Watched::new(store);
+    let store: &dyn BackupStore = &watched;
+    check_root(store, plan)?;
+    if store.as_local().is_none()
+        && let Err(e) = store.root_exists()
+    {
+        if crate::store::is_offline(&e) {
+            return Err(SyncError::Offline(explain(&e)));
+        }
+        // A server that fails the conditional-write check is not used.
+        if e.kind() == io::ErrorKind::Unsupported {
+            return Err(SyncError::Io(format!("{e}; nothing was archived")));
+        }
+    }
+    check_owner_in(store, plan)?;
+    let recorder = state.map(|state| MoveRecord {
+        state,
+        device: &plan.device_key,
+        root: &plan.root,
+    });
     if !confirmed {
         let why = blocking_reasons(plan);
         if !why.is_empty() {
@@ -778,12 +926,12 @@ pub fn archive_removed(
             return Err(SyncError::NeedsConfirmation(why));
         }
     }
-    record_archive_name(plan, &root_canon, confirmed).map_err(|e| {
+    record_archive_name(plan, store, confirmed).map_err(|e| {
         error!("Archiving refused: {e}");
         SyncError::Io(format!("{e}; nothing was archived"))
     })?;
     if confirmed {
-        confirm_foreign_files(&root_canon);
+        confirm_foreign_files(store);
     }
     let base = archive_base(&plan.archive_name, stamp).map_err(|e| {
         error!("Bad archive folder name {stamp:?}: {e}");
@@ -798,9 +946,14 @@ pub fn archive_removed(
         counted(plan.removed.len(), "file", "files")
     );
     // JPG copies the app made follow their HEICs. The list is saved as they go, now and then.
-    let mut made = MadeList::load(&root_canon);
+    let mut made = MadeList::load_in(store);
     let mut unsaved = 0usize;
     for (i, r) in plan.removed.iter().enumerate() {
+        if let Some(why) = watched.offline() {
+            warn!("The backup could not be reached, so archiving stops here: {why}");
+            report.offline = Some(why);
+            break;
+        }
         if r.held && !confirmed {
             warn!(
                 "Held back: {} sits under a folder the device lists as empty",
@@ -819,8 +972,8 @@ pub fn archive_removed(
         // HEIC then can't be moved, the JPG is put back (below), so a pair is never split.
         let mut jpg_went: Option<(OldCopy, Option<MadeEntry>)> = None;
         if let Some(jpg) = &r.jpg {
-            let went = check_backup_file(&root_canon, &r.path, r.size).and_then(|_| {
-                move_made_jpg(&root_canon, plan, stamp, &Ok(()), jpg).map_err(|e| {
+            let went = check_backup_file(store, &r.path, r.size).and_then(|()| {
+                move_made_jpg(store, plan, stamp, &Ok(()), recorder.as_ref(), jpg).map_err(|e| {
                     format!("its JPG copy could not be moved ({e}); both left in place")
                 })
             });
@@ -837,7 +990,7 @@ pub fn archive_removed(
                     unsaved += 1;
                     if unsaved >= 20 {
                         unsaved = 0;
-                        save_made(&made, &root_canon);
+                        save_made(&made, store);
                     }
                     if report.folder.is_none() && matches!(went, OldCopy::Archived(_)) {
                         report.folder = Some(base.clone());
@@ -853,7 +1006,7 @@ pub fn archive_removed(
             }
         }
         if mode == DeletedFiles::RecycleBin {
-            match heic_move_fault().map_or_else(|| bin_one(&root_canon, &r.path, r.size), Err) {
+            match heic_move_fault().map_or_else(|| bin_one(store, &r.path, r.size), Err) {
                 Ok(()) => {
                     info!("Sent {} to the {}", r.path, platform::BIN_NAME);
                     report.moved += 1;
@@ -861,11 +1014,10 @@ pub fn archive_removed(
                 }
                 Err(error) => {
                     error!("Could not send {} to the bin: {error}", r.path);
-                    let (error, back) =
-                        put_jpg_back(&root_canon, &mut made, r, jpg_went.take(), error);
+                    let (error, back) = put_jpg_back(store, &mut made, r, jpg_went.take(), error);
                     if back {
                         report.jpgs_moved = report.jpgs_moved.saturating_sub(1);
-                        save_made(&made, &root_canon);
+                        save_made(&made, store);
                     }
                     report.failed += 1;
                     on_event(ArchiveEvent::Failed { removed: i, error });
@@ -876,12 +1028,13 @@ pub fn archive_removed(
         let moved = heic_move_fault().map_or_else(
             || {
                 archive_one(
-                    &root_canon,
+                    store,
                     &plan.archive_name,
                     plan.archive_layout,
                     stamp,
                     &r.path,
                     r.size,
+                    recorder.as_ref(),
                 )
             },
             Err,
@@ -895,10 +1048,10 @@ pub fn archive_removed(
             }
             Err(error) => {
                 error!("Could not archive {}: {error}", r.path);
-                let (error, back) = put_jpg_back(&root_canon, &mut made, r, jpg_went.take(), error);
+                let (error, back) = put_jpg_back(store, &mut made, r, jpg_went.take(), error);
                 if back {
                     report.jpgs_moved = report.jpgs_moved.saturating_sub(1);
-                    save_made(&made, &root_canon);
+                    save_made(&made, store);
                 }
                 report.failed += 1;
                 on_event(ArchiveEvent::Failed { removed: i, error });
@@ -906,7 +1059,7 @@ pub fn archive_removed(
         }
     }
     if unsaved > 0 {
-        save_made(&made, &root_canon);
+        save_made(&made, store);
     }
     info!(
         "Moving finished: {} moved into {to_where}, {} left in place",
@@ -922,7 +1075,7 @@ pub fn archive_removed(
 /// went to the bin, or the move fails), the message says so: the HEIC stays, its JPG copy is
 /// where it went.
 fn put_jpg_back(
-    root_canon: &Path,
+    store: &dyn BackupStore,
     made: &mut MadeList,
     r: &Removed,
     went: Option<(OldCopy, Option<MadeEntry>)>,
@@ -932,12 +1085,12 @@ fn put_jpg_back(
         return (error, false);
     };
     let back = match &went {
-        OldCopy::Archived(to) | OldCopy::RenamedAside(to) => {
-            check_backup_file(root_canon, to, jpg.size).and_then(|from| {
-                platform::rename_no_replace(&from, &jpg.path.under(root_canon))
+        OldCopy::Archived(to) | OldCopy::RenamedAside(to) => check_backup_file(store, to, jpg.size)
+            .and_then(|()| {
+                store
+                    .move_no_replace(to, &jpg.path)
                     .map_err(|e| format!("could not move it back: {e}"))
-            })
-        }
+            }),
         OldCopy::Binned | OldCopy::Missing => {
             Err(format!("it is in the {} now", platform::BIN_NAME))
         }
@@ -989,26 +1142,26 @@ fn heic_move_fault() -> Option<String> {
 
 /// Saves the made list; a list that can't be saved only means some entries stay behind for
 /// files that have moved, which the next JPG step notices (the file is gone).
-fn save_made(made: &MadeList, root_canon: &Path) {
-    if let Err(e) = made.save(root_canon) {
+fn save_made(made: &MadeList, store: &dyn BackupStore) {
+    if let Err(e) = made.save_in(store) {
         warn!("Could not save the list of JPG copies: {e}");
     }
 }
 
 /// Forgets these JPGs (paths relative to the backup folder) in the made list, if they are in
 /// it. Not fatal if the list can't be saved: an entry for a file that is gone is noticed later.
-fn forget_made<'a>(root_canon: &Path, paths: impl IntoIterator<Item = &'a str>) {
+fn forget_made<'a>(store: &dyn BackupStore, paths: impl IntoIterator<Item = &'a str>) {
     let mut paths = paths.into_iter().peekable();
     if paths.peek().is_none() {
         return;
     }
-    let mut made = MadeList::load(root_canon);
+    let mut made = MadeList::load_in(store);
     let mut any = false;
     for p in paths {
         any |= made.remove_jpg(p).is_some();
     }
     if any {
-        save_made(&made, root_canon);
+        save_made(&made, store);
     }
 }
 
@@ -1017,10 +1170,11 @@ fn forget_made<'a>(root_canon: &Path, paths: impl IntoIterator<Item = &'a str>) 
 /// and sub-path as its HEIC), renamed aside, or into the bin. Never replaces anything. The
 /// JPG must still be the plain file of the size the scan saw.
 fn move_made_jpg(
-    root_canon: &Path,
+    store: &dyn BackupStore,
     plan: &ScanPlan,
     stamp: &str,
     archive_ready: &Result<(), String>,
+    recorder: Option<&MoveRecord<'_>>,
     jpg: &MadeJpg,
 ) -> Result<OldCopy, String> {
     match plan.deleted_files {
@@ -1029,24 +1183,26 @@ fn move_made_jpg(
                 return Err(format!("the archive can't be used: {e}"));
             }
             archive_one(
-                root_canon,
+                store,
                 &plan.archive_name,
                 plan.archive_layout,
                 stamp,
                 &jpg.path,
                 jpg.size,
+                recorder,
             )
             .map(OldCopy::Archived)
         }
         DeletedFiles::LeaveInPlace => {
-            let src = check_backup_file(root_canon, &jpg.path, jpg.size)?;
-            let (rel, full) = first_free_aside_path(&src, &jpg.path, stamp)?;
-            platform::rename_no_replace(&src, &full)
+            check_backup_file(store, &jpg.path, jpg.size)?;
+            let rel = first_free_aside_path(store, &jpg.path, stamp)?;
+            store
+                .move_no_replace(&jpg.path, &rel)
                 .map_err(|e| format!("could not move it aside: {e}"))?;
             Ok(OldCopy::RenamedAside(rel))
         }
         DeletedFiles::RecycleBin => {
-            bin_one(root_canon, &jpg.path, jpg.size)?;
+            bin_one(store, &jpg.path, jpg.size)?;
             Ok(OldCopy::Binned)
         }
     }
@@ -1054,12 +1210,12 @@ fn move_made_jpg(
 
 /// An archive was confirmed: the files that were in the folder before it was claimed no longer
 /// ask first. Not fatal if the marker can't be rewritten: they just ask again.
-fn confirm_foreign_files(root_canon: &Path) {
-    if let OwnerState::Owned(mut o) = owner::read(root_canon)
+fn confirm_foreign_files(store: &dyn BackupStore) {
+    if let OwnerState::Owned(mut o) = owner::read_in(store)
         && o.foreign_unconfirmed
     {
         o.foreign_unconfirmed = false;
-        if let Err(e) = owner::write(root_canon, &o) {
+        if let Err(e) = owner::write_in(store, &o) {
             warn!("Could not record that the files already in the folder were confirmed: {e}");
         }
     }
@@ -1095,57 +1251,80 @@ fn archive_candidate(
     SafeRelPath::from_components(&parts).map_err(|e| e.to_string())
 }
 
-/// The first archive name for `path` that isn't taken, with its folder made. Nothing is moved.
+/// The first archive name for `path` that isn't taken, with its folder made (on a folder store).
+/// Nothing is moved.
 fn first_free_archive_path(
-    root_canon: &Path,
+    store: &dyn BackupStore,
     archive_name: &str,
     layout: ArchiveLayout,
     stamp: &str,
     path: &SafeRelPath,
-) -> Result<(SafeRelPath, PathBuf), String> {
+) -> Result<SafeRelPath, String> {
     for n in 1..=MAX_NUMBERED {
         let to = archive_candidate(archive_name, layout, stamp, path, n)?;
-        let folder = prepare_parent(root_canon, &to).map_err(|e| e.to_string())?;
-        let full = folder.join(to.file_name());
-        match fs::symlink_metadata(&full) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((to, full)),
+        prepare_local(store, &to)?;
+        match store.stat(&to) {
+            Ok(None) => return Ok(to),
             Err(e) => return Err(format!("could not check {to}: {e}")),
-            Ok(_) => continue,
+            Ok(Some(_)) => continue,
         }
     }
     Err("too many files with this name in the archive folder; left in place".into())
 }
 
-/// Check that a backup file is still the plain file of `size` it was at scan time, in a folder
-/// that resolves inside the backup folder.
-fn check_backup_file(root_canon: &Path, path: &SafeRelPath, size: u64) -> Result<PathBuf, String> {
-    let src = path.under(root_canon);
-    // Its folder must still resolve inside the backup folder: no junction swapped in since.
-    let folder = src.parent().ok_or("it has no folder")?;
-    let folder_canon =
-        fs::canonicalize(folder).map_err(|e| format!("could not check its folder: {e}"))?;
-    if !folder_canon.starts_with(root_canon) {
-        return Err("its folder now leads outside the backup folder; left in place".into());
+/// On a folder store: makes the folders for `rel`, refusing links and files in the way and any
+/// folder that no longer resolves inside the backup folder. Other stores have no folders.
+fn prepare_local(store: &dyn BackupStore, rel: &SafeRelPath) -> Result<(), String> {
+    let Some(local) = store.as_local() else {
+        return Ok(());
+    };
+    let root = fs::canonicalize(&local.root)
+        .map_err(|e| format!("could not resolve the backup folder: {e}"))?;
+    prepare_parent(&root, rel)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Check that a backup file is still the plain file of `size` it was at scan time. On a folder
+/// store its folder must also still resolve inside the backup folder.
+fn check_backup_file(store: &dyn BackupStore, path: &SafeRelPath, size: u64) -> Result<(), String> {
+    if let Some(local) = store.as_local() {
+        let root_canon = fs::canonicalize(&local.root)
+            .map_err(|e| format!("could not check its folder: {e}"))?;
+        // Its folder must still resolve inside the backup folder: no junction swapped in since.
+        let src = path.under(&root_canon);
+        let folder = src.parent().ok_or("it has no folder")?;
+        let folder_canon =
+            fs::canonicalize(folder).map_err(|e| format!("could not check its folder: {e}"))?;
+        if !folder_canon.starts_with(&root_canon) {
+            return Err("its folder now leads outside the backup folder; left in place".into());
+        }
     }
-    match fs::symlink_metadata(&src) {
-        Ok(m) if m.is_file() && !is_link(&m) && m.len() == size => Ok(src),
-        Ok(_) => Err("it changed since the scan; left in place".into()),
+    match store.stat(path) {
+        Ok(Some(st)) if st.kind == StoreKind::File && st.size == size => Ok(()),
+        Ok(Some(_)) => Err("it changed since the scan; left in place".into()),
+        Ok(None) => Err("could not check it: it is not there".into()),
         Err(e) => Err(format!("could not check it: {e}")),
     }
 }
 
 fn archive_one(
-    root_canon: &Path,
+    store: &dyn BackupStore,
     archive_name: &str,
     layout: ArchiveLayout,
     stamp: &str,
     path: &SafeRelPath,
     size: u64,
+    recorder: Option<&MoveRecord<'_>>,
 ) -> Result<SafeRelPath, String> {
-    let src = check_backup_file(root_canon, path, size)?;
+    check_backup_file(store, path, size)?;
     for _ in 0..MAX_NUMBERED {
-        let (to, full) = first_free_archive_path(root_canon, archive_name, layout, stamp, path)?;
-        match platform::rename_no_replace(&src, &full) {
+        let to = first_free_archive_path(store, archive_name, layout, stamp, path)?;
+        let moved = match recorder.filter(|_| store.as_local().is_none()) {
+            Some(r) => r.around(store, path, &to),
+            None => store.move_no_replace(path, &to),
+        };
+        match moved {
             Ok(()) => return Ok(to),
             // Taken between the check and the move: pick the next name.
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -1155,16 +1334,66 @@ fn archive_one(
     Err("too many files with this name in the archive folder; left in place".into())
 }
 
+/// Where the crash record of a lone move is kept (see [`archive_removed_in`]).
+struct MoveRecord<'a> {
+    state: &'a StateDir,
+    device: &'a str,
+    root: &'a Path,
+}
+
+impl MoveRecord<'_> {
+    /// Moves `from` to `to` with a crash record written before and cleared after. If the
+    /// record can't be written nothing is moved.
+    fn around(
+        &self,
+        store: &dyn BackupStore,
+        from: &SafeRelPath,
+        to: &SafeRelPath,
+    ) -> io::Result<()> {
+        let rec = InProgress {
+            device: self.device.to_string(),
+            root: self.root.to_path_buf(),
+            source: from.as_str().to_string(),
+            temp: PathBuf::new(),
+            replace: Some(ReplaceStep {
+                original: PathBuf::from(from.as_str()),
+                archived: PathBuf::from(to.as_str()),
+                goes: OldCopyGoes::Archive,
+                staged_size: None,
+            }),
+            destination: store.destination(),
+        };
+        self.state.begin_copy(&rec).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not record the move in progress: {e}"),
+            )
+        })?;
+        let moved = store.move_no_replace(from, to);
+        // A crash leaves the record for the next start; a move that returned has been
+        // reported, so the record goes either way.
+        if let Err(e) = self.state.end_copy() {
+            warn!("Could not clear the record of the move in progress: {e}");
+        }
+        moved
+    }
+}
+
+/// What a store without a bin answers when asked for one.
+const BIN_UNAVAILABLE: &str = "sending files to the bin is not available for this backup";
+
 /// Send a backup file that has left the device to the Recycle Bin or Trash, after the same
 /// checks as archiving it. Never deletes: if the bin can't take it, it stays.
-fn bin_one(root_canon: &Path, path: &SafeRelPath, size: u64) -> Result<(), String> {
-    let src = check_backup_file(root_canon, path, size)?;
-    platform::send_to_bin(&src).map_err(|e| {
-        if fs::symlink_metadata(&src).is_err() {
+fn bin_one(store: &dyn BackupStore, path: &SafeRelPath, size: u64) -> Result<(), String> {
+    if !store.supports_bin() {
+        return Err(format!("{BIN_UNAVAILABLE}; left in place"));
+    }
+    check_backup_file(store, path, size)?;
+    store.send_to_bin(path).map_err(|e| {
+        if matches!(store.stat(path), Ok(None)) {
             // The bin said no, yet the file is no longer there. Do not claim it was left.
             error!(
-                "{}: the {} reported a failure ({e}) but the file is gone from the backup folder; it may not be in the {}",
-                src.display(),
+                "{path}: the {} reported a failure ({e}) but the file is gone from the backup folder; it may not be in the {}",
                 platform::BIN_NAME,
                 platform::BIN_NAME
             );
@@ -1174,7 +1403,7 @@ fn bin_one(root_canon: &Path, path: &SafeRelPath, size: u64) -> Result<(), Strin
                 platform::BIN_NAME
             );
         }
-        bin_refused(&e)
+        bin_refused(&e.to_string())
     })
 }
 
@@ -1209,6 +1438,20 @@ pub struct ArchiveRenamed {
 /// `archive_names` and lists the new one, so neither is ever taken for backup content. The
 /// caller then stores the new name in the device's settings and scans again.
 pub fn rename_archive(plan: &ScanPlan, new_name: &str) -> Result<ArchiveRenamed, SyncError> {
+    rename_archive_in(&LocalStore::new(&plan.root), plan, new_name)
+}
+
+/// [`rename_archive`] for a store. Only a folder on this PC can rename a folder.
+pub fn rename_archive_in(
+    store: &dyn BackupStore,
+    plan: &ScanPlan,
+    new_name: &str,
+) -> Result<ArchiveRenamed, SyncError> {
+    if store.as_local().is_none() {
+        return Err(SyncError::Io(
+            "renaming the archive folder is not available for this backup".into(),
+        ));
+    }
     let old = plan.archive_name.as_str();
     owner::validate_archive_name(new_name).map_err(SyncError::Io)?;
     if new_name.eq_ignore_ascii_case(old) {
@@ -1225,7 +1468,7 @@ pub fn rename_archive(plan: &ScanPlan, new_name: &str) -> Result<ArchiveRenamed,
             "the device already has a folder named {new_name:?} at the top, so it can't be the archive folder's name"
         )));
     }
-    let root_canon = checked_root(plan)?;
+    let root_canon = owner_root(store, plan)?;
     check_owner(plan, &root_canon)?;
     // Whether or not there is an archive to move, the new name must not be one of the backup's
     // own top-level names (in any letter case), or its content would be taken for archive.
@@ -1274,8 +1517,8 @@ pub fn rename_archive(plan: &ScanPlan, new_name: &str) -> Result<ArchiveRenamed,
 }
 
 struct FileCtx<'a> {
+    store: &'a dyn BackupStore,
     root: &'a Path,
-    root_canon: &'a Path,
     device: &'a str,
     index: usize,
     entry: &'a PlanEntry,
@@ -1293,7 +1536,7 @@ struct FileCtx<'a> {
 
 enum Outcome {
     /// Copied to the target; the last is where a changed file's old copy went.
-    Copied(SafeRelPath, u64, Option<OldCopy>),
+    Copied(SafeRelPath, u64, Option<OldCopy>, Uploaded),
     Already(SafeRelPath),
     Skipped,
     Cancelled,
@@ -1374,19 +1617,18 @@ fn copy_one(
     };
 
     let target = entry.target.clone();
-    let dir = match prepare_parent(ctx.root_canon, &target) {
-        Ok(d) => d,
-        Err(e) => return Outcome::Failed(e.to_string()),
-    };
-    let final_path = dir.join(target.file_name());
+    let store = ctx.store;
+    if let Err(e) = prepare_local(store, &target) {
+        return Outcome::Failed(e);
+    }
     match kind {
-        Kind::Fresh => match fs::symlink_metadata(&final_path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Kind::Fresh => match store.stat(&target) {
+            Ok(None) => {}
             // The same file is already there: nothing to copy.
-            Ok(m) if m.is_file() && !is_link(&m) && m.len() == size => {
+            Ok(Some(st)) if st.kind == StoreKind::File && st.size == size => {
                 return Outcome::Already(target);
             }
-            Ok(_) => {
+            Ok(Some(_)) => {
                 return Outcome::Failed(format!(
                     "a different file is at {target} now, so it was not overwritten; scan again"
                 ));
@@ -1407,20 +1649,20 @@ fn copy_one(
             } else {
                 entry.existing_size
             };
-            match fs::symlink_metadata(&final_path) {
-                Ok(meta) if is_link(&meta) || !meta.is_file() => {
+            match store.stat(&target) {
+                Ok(Some(st)) if st.kind != StoreKind::File => {
                     return Outcome::Failed(
                         "the existing backup is not a plain file; not touching it".into(),
                     );
                 }
-                Ok(meta) if Some(meta.len()) == want => {}
-                Ok(_) => {
+                Ok(Some(st)) if Some(st.size) == want => {}
+                Ok(Some(_)) => {
                     return Outcome::Failed(
                         "the backup file changed since the scan; not touching it. Scan again"
                             .into(),
                     );
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Ok(None) => {
                     return Outcome::Failed(
                         "the backup file is no longer there; scan again".into(),
                     );
@@ -1436,46 +1678,97 @@ fn copy_one(
                     "the old copy can't be moved into the archive: {e}; not replaced"
                 ));
             }
+            if ctx.plan.deleted_files == DeletedFiles::RecycleBin && !store.supports_bin() {
+                return Outcome::Failed(format!(
+                    "{BIN_UNAVAILABLE}, so the old copy can't be moved out of the way; not replaced"
+                ));
+            }
         }
     }
-    let temp = dir.join(crate::paths::fit_name(target.file_name(), TEMP_SUFFIX));
-    if let Err(e) = clear_stale_temp(&temp) {
-        return Outcome::Failed(e);
+    #[cfg(test)]
+    if let Some(blocked) = test_temp_hook(ctx, &target) {
+        return Outcome::Failed(blocked);
     }
-    let record = InProgress {
+    let mut record = InProgress {
         device: ctx.device.to_string(),
         root: ctx.root.to_path_buf(),
         source: entry.source.as_str().to_string(),
-        temp: temp.clone(),
+        temp: PathBuf::new(),
         replace: None,
+        destination: store.destination(),
     };
-    if let Err(e) = state.begin_copy(&record) {
-        return Outcome::Failed(format!("could not record the copy in progress: {e}"));
+    // A store that knows the temp's name up front gets the crash record first, so a crash
+    // right after the temp appears always finds it named.
+    let planned = store.planned_ref(&target);
+    if let Some(planned) = &planned {
+        record.temp = PathBuf::from(planned);
+        if let Err(e) = state.begin_copy(&record) {
+            return Outcome::Failed(format!("could not record the copy in progress: {e}"));
+        }
     }
-
-    // Whether the temp is ours to remove: only once this call created it. A file that was
-    // already there when `create_new` was refused is someone else's, whole or not.
-    let mut created = false;
+    // The upload starts the temporary copy (an unfinished one already at its name is moved
+    // aside by the store, never removed). Nothing is created if it fails.
+    let up_mtime = before.modified.or(entry.modified);
+    let upload = store.begin_upload(&target, size, up_mtime);
+    let mut upload = match upload {
+        Ok(u) => u,
+        Err(e) => {
+            if planned.is_some()
+                && let Err(e) = state.end_copy()
+            {
+                warn!("Could not clear the record of the copy in progress: {e}");
+            }
+            return if is_disk_full(&e) {
+                Outcome::DiskFull(DISK_FULL_TEXT.into())
+            } else {
+                Outcome::Failed(format!("could not create the copy of {target}: {e}"))
+            };
+        }
+    };
+    let mut temp_ref = upload.journal_ref();
     // Set when an unfinished temp could not be removed: its crash record is then kept, so the
     // next start removes it (otherwise a later sync would keep it forever as a partial copy).
     let mut keep_record = false;
+    match &planned {
+        Some(p) if *p != temp_ref => {
+            // Not what the record names: throw it away rather than leave one nobody can clean up.
+            record.temp = PathBuf::from(&temp_ref);
+            discard_upload(upload, state, &record, &mut keep_record);
+            if !keep_record && let Err(e) = state.end_copy() {
+                warn!("Could not clear the record of the copy in progress: {e}");
+            }
+            return Outcome::Failed(format!(
+                "the copy of {target} started under a different name than planned; nothing was copied"
+            ));
+        }
+        Some(_) => {}
+        // An object store only learns the upload's name when it starts, so its record comes
+        // after. A crash in between leaves an unrecorded upload; the start-up check will abort
+        // the uploads of ours that no record names.
+        None => {
+            record.temp = PathBuf::from(&temp_ref);
+            if let Err(e) = state.begin_copy(&record) {
+                discard_upload(upload, state, &record, &mut keep_record);
+                return Outcome::Failed(format!("could not record the copy in progress: {e}"));
+            }
+        }
+    }
+    // From here until the whole file has arrived, at the size the device reported, the
+    // connection is in doubt.
     let outcome = (|| {
-        let wrote = write_temp(
+        let wrote = write_upload(
             source,
             ctx,
             &before,
-            &temp,
+            upload.as_mut(),
             ctl,
             on_event,
             unfinished,
-            &mut created,
         );
         let bytes = match wrote {
             Ok(b) => b,
             Err(stop) => {
-                if created {
-                    discard_temp(&temp, state, &record, &mut keep_record);
-                }
+                discard_upload(upload, state, &record, &mut keep_record);
                 return match stop {
                     Stop::Skipped => Outcome::Skipped,
                     Stop::Cancelled => Outcome::Cancelled,
@@ -1485,13 +1778,20 @@ fn copy_one(
             }
         };
         match kind {
-            Kind::Fresh => match platform::rename_no_replace(&temp, &final_path) {
-                Ok(()) => Outcome::Copied(target.clone(), bytes, None),
+            Kind::Fresh => match upload.finish_no_replace() {
+                Ok(tag) => Outcome::Copied(
+                    target.clone(),
+                    bytes,
+                    None,
+                    Uploaded {
+                        tag,
+                        mtime: up_mtime,
+                    },
+                ),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     // Something turned up at the target during the copy: never overwrite it.
-                    discard_temp(&temp, state, &record, &mut keep_record);
-                    match fs::symlink_metadata(&final_path) {
-                        Ok(m) if m.is_file() && !is_link(&m) && m.len() == bytes => {
+                    match store.stat(&target) {
+                        Ok(Some(st)) if st.kind == StoreKind::File && st.size == bytes => {
                             Outcome::Already(target.clone())
                         }
                         _ => Outcome::Failed(format!(
@@ -1499,19 +1799,18 @@ fn copy_one(
                         )),
                     }
                 }
-                Err(e) => Outcome::Failed(format!(
-                    "copied, but could not move it into place ({e}); the copy is kept as {} (a later sync moves it aside, never deletes it)",
-                    temp.display()
-                )),
+                Err(e) if is_disk_full(&e) => Outcome::DiskFull(DISK_FULL_TEXT.into()),
+                Err(e) => Outcome::Failed(finish_failed(ctx, &temp_ref, &e)),
             },
             Kind::Changed | Kind::Replace => replace_changed(
                 ctx,
                 state,
                 &record,
-                &temp,
-                &final_path,
+                upload,
+                &mut temp_ref,
                 &target,
                 bytes,
+                up_mtime,
                 &mut keep_record,
             ),
         }
@@ -1519,7 +1818,7 @@ fn copy_one(
     if keep_record {
         warn!(
             "The unfinished copy {} could not be removed; the next start will try again",
-            temp.display()
+            temp_ref
         );
     } else if let Err(e) = state.end_copy() {
         warn!("Could not clear the record of the copy in progress: {e}");
@@ -1527,9 +1826,29 @@ fn copy_one(
     outcome
 }
 
-/// The moves of a changed file, with the new copy whole in `temp` and the old one at
-/// `final_path`: the old copy out of the way, then the new one into its place, neither move
-/// replacing anything. Where the old copy goes is the device's [`DeletedFiles`] choice: into
+/// What a failed finish of an upload is called. A finish that was refused for the name leaves
+/// nothing; any other failure may leave the finished temporary copy.
+fn finish_failed(ctx: &FileCtx<'_>, temp_ref: &str, e: &io::Error) -> String {
+    if e.kind() == io::ErrorKind::InvalidData {
+        return format!("the copy was not saved: {e}");
+    }
+    format!(
+        "copied, but could not move it into place ({e}); the copy may be kept as {} (a later sync moves it aside, never deletes it)",
+        shown_temp(ctx, temp_ref)
+    )
+}
+
+/// The unfinished copy as shown in messages: its path for a folder store, its reference otherwise.
+fn shown_temp(ctx: &FileCtx<'_>, temp_ref: &str) -> String {
+    match ctx.store.as_local() {
+        Some(local) => local.root.join(temp_ref).display().to_string(),
+        None => temp_ref.to_string(),
+    }
+}
+
+/// The moves of a changed file, with the new copy whole but not yet visible (`upload`) and the
+/// old one at `target`: the old copy out of the way, then the new one into its place, neither
+/// move replacing anything. Where the old copy goes is the device's [`DeletedFiles`] choice: into
 /// the archive, renamed beside the new one, or into the Recycle Bin or Trash. The crash record
 /// is rewritten first so a crash between the moves can be finished.
 #[allow(clippy::too_many_arguments)]
@@ -1537,18 +1856,43 @@ fn replace_changed(
     ctx: &FileCtx<'_>,
     state: &StateDir,
     record: &InProgress,
-    temp: &Path,
-    final_path: &Path,
+    mut upload: Box<dyn Upload>,
+    temp_ref: &mut String,
     target: &SafeRelPath,
     bytes: u64,
+    up_mtime: Option<SystemTime>,
     keep_record: &mut bool,
 ) -> Outcome {
+    let store = ctx.store;
     let mode = ctx.plan.deleted_files;
+    // Put every byte of the new copy where the store keeps it before anything moves: a stop
+    // after the old copy has moved can then still finish the new one. The upload's reference
+    // may change with that, so the crash record is rewritten to name it.
+    if let Err(e) = upload.stage() {
+        discard_upload(upload, state, record, keep_record);
+        return if is_disk_full(&e) {
+            Outcome::DiskFull(DISK_FULL_TEXT.into())
+        } else {
+            Outcome::Failed(format!(
+                "could not store the new copy before replacing the old one ({e}); nothing was replaced"
+            ))
+        };
+    }
+    *temp_ref = upload.journal_ref();
+    let staged = InProgress {
+        temp: PathBuf::from(temp_ref.as_str()),
+        ..record.clone()
+    };
+    let record = &staged;
+    if let Err(e) = state.begin_copy(record) {
+        discard_upload(upload, state, record, keep_record);
+        return Outcome::Failed(format!("could not record the copy in progress: {e}"));
+    }
     // The JPG the app made from the old HEIC goes first, the way the old copy will, so a crash
     // between the two leaves a HEIC without its JPG (the next sync makes it again) and never a
     // JPG that lost its way. Nothing here has been moved yet if it fails.
     if let Some(jpg) = &ctx.entry.old_jpg {
-        match move_made_jpg(ctx.root_canon, ctx.plan, ctx.stamp, ctx.archive_ready, jpg) {
+        match move_made_jpg(store, ctx.plan, ctx.stamp, ctx.archive_ready, None, jpg) {
             Ok(went) => {
                 info!(
                     "The JPG copy {} of the old {} was {}",
@@ -1556,10 +1900,10 @@ fn replace_changed(
                     target,
                     went.describe()
                 );
-                forget_made(ctx.root_canon, [jpg.path.as_str()]);
+                forget_made(store, [jpg.path.as_str()]);
             }
             Err(e) => {
-                discard_temp(temp, state, record, keep_record);
+                discard_upload(upload, state, record, keep_record);
                 return Outcome::Failed(format!(
                     "could not move the JPG copy of the old photo out of the way ({e}); nothing was replaced"
                 ));
@@ -1569,40 +1913,56 @@ fn replace_changed(
     // Where the old copy goes (nothing is moved yet).
     let place = match mode {
         DeletedFiles::Archive => first_free_archive_path(
-            ctx.root_canon,
+            store,
             &ctx.plan.archive_name,
             ctx.plan.archive_layout,
             ctx.stamp,
             target,
         )
-        .map(|(rel, full)| (OldCopyGoes::Archive, full, OldCopy::Archived(rel))),
-        DeletedFiles::LeaveInPlace => first_free_aside_path(final_path, target, ctx.stamp)
-            .map(|(rel, full)| (OldCopyGoes::Aside, full, OldCopy::RenamedAside(rel))),
-        DeletedFiles::RecycleBin => Ok((OldCopyGoes::Bin, PathBuf::new(), OldCopy::Binned)),
+        .map(|rel| {
+            (
+                OldCopyGoes::Archive,
+                Some(rel.clone()),
+                OldCopy::Archived(rel),
+            )
+        }),
+        DeletedFiles::LeaveInPlace => first_free_aside_path(store, target, ctx.stamp).map(|rel| {
+            (
+                OldCopyGoes::Aside,
+                Some(rel.clone()),
+                OldCopy::RenamedAside(rel),
+            )
+        }),
+        DeletedFiles::RecycleBin => Ok((OldCopyGoes::Bin, None, OldCopy::Binned)),
     };
     let (goes, moved_to, mut old_copy) = match place {
         Ok(p) => p,
         Err(e) => {
-            discard_temp(temp, state, record, keep_record);
+            discard_upload(upload, state, record, keep_record);
             return Outcome::Failed(format!("could not prepare where the old copy goes: {e}"));
         }
     };
     let ready = InProgress {
         replace: Some(ReplaceStep {
-            original: final_path.to_path_buf(),
-            archived: moved_to.clone(),
+            original: PathBuf::from(target.as_str()),
+            archived: moved_to
+                .as_ref()
+                .map_or_else(PathBuf::new, |m| PathBuf::from(m.as_str())),
             goes,
+            staged_size: Some(bytes),
         }),
         ..record.clone()
     };
     if let Err(e) = state.begin_copy(&ready) {
-        discard_temp(temp, state, record, keep_record);
+        discard_upload(upload, state, record, keep_record);
         return Outcome::Failed(format!("could not record the replacement in progress: {e}"));
     }
     // Step 2: the old copy out of the way.
-    let moved = match goes {
-        OldCopyGoes::Bin => platform::send_to_bin(final_path).map_err(|e| bin_refused(&e)),
-        _ => platform::rename_no_replace(final_path, &moved_to).map_err(|e| {
+    let moved = match (goes, &moved_to) {
+        (OldCopyGoes::Bin, _) | (_, None) => store
+            .send_to_bin(target)
+            .map_err(|e| bin_refused(&e.to_string())),
+        (_, Some(to)) => store.move_no_replace(target, to).map_err(|e| {
             format!(
                 "could not move the old copy {} ({e}); it is left in place",
                 match goes {
@@ -1615,29 +1975,36 @@ fn replace_changed(
     if let Err(why) = moved {
         // Normally nothing has moved: undo by dropping the unfinished new copy (it is on the
         // device). If the old copy is gone anyway, the bin took it after all, so carry on.
-        let gone = matches!(
-            fs::symlink_metadata(final_path),
-            Err(e) if e.kind() == io::ErrorKind::NotFound
-        );
+        let gone = matches!(store.stat(target), Ok(None));
         if !(goes == OldCopyGoes::Bin && gone) {
-            discard_temp(temp, state, record, keep_record);
+            discard_upload(upload, state, record, keep_record);
             return Outcome::Failed(why);
         }
         error!(
-            "{why}, but the old copy is gone from {}: the {} may not have it",
-            final_path.display(),
+            "{why}, but the old copy is gone from {target}: the {} may not have it",
             platform::BIN_NAME
         );
         old_copy = OldCopy::Missing;
     }
     // Step 3: the new copy into place.
-    match platform::rename_no_replace(temp, final_path) {
-        Ok(()) => Outcome::Copied(target.clone(), bytes, Some(old_copy)),
+    match upload.finish_no_replace() {
+        Ok(tag) => Outcome::Copied(
+            target.clone(),
+            bytes,
+            Some(old_copy),
+            Uploaded {
+                tag,
+                mtime: up_mtime,
+            },
+        ),
         Err(e) => {
             // Put the old copy back if it can be and its place is still free; either way both
-            // copies exist (one maybe in the bin).
+            // copies exist (one maybe in the bin), unless the new copy was dropped with the
+            // failed finish: it is on the device and the next sync makes it again.
             let restored = goes != OldCopyGoes::Bin
-                && platform::rename_no_replace(&moved_to, final_path).is_ok();
+                && moved_to
+                    .as_ref()
+                    .is_some_and(|m| store.move_no_replace(m, target).is_ok());
             let old = match (&old_copy, restored) {
                 (_, true) => "the old copy was put back".to_string(),
                 (OldCopy::Binned, _) => {
@@ -1649,10 +2016,18 @@ fn replace_changed(
                 ),
                 (other, _) => format!("the old copy was {}", other.describe()),
             };
-            Outcome::Failed(format!(
-                "could not move the new copy into place ({e}); {old}; the new copy is kept as {}",
-                temp.display()
-            ))
+            // Sealing is done, so only a refused name removes the upload; any other failure of
+            // the finish leaves the whole temporary copy where it is.
+            if e.kind() == io::ErrorKind::AlreadyExists || e.kind() == io::ErrorKind::InvalidData {
+                Outcome::Failed(format!(
+                    "could not move the new copy into place ({e}); {old}; the new copy was not kept (it is still on the device)"
+                ))
+            } else {
+                Outcome::Failed(format!(
+                    "could not move the new copy into place ({e}); {old}; the new copy may be kept as {}",
+                    shown_temp(ctx, temp_ref)
+                ))
+            }
         }
     }
 }
@@ -1661,24 +2036,20 @@ fn replace_changed(
 /// `IMG_0001 (old 2026-11-18 09-30).jpg`, numbered if taken (`... (old ...) (2).jpg`). The date
 /// and time are this sync's, to the minute. Nothing is moved.
 fn first_free_aside_path(
-    final_path: &Path,
+    store: &dyn BackupStore,
     target: &SafeRelPath,
     stamp: &str,
-) -> Result<(SafeRelPath, PathBuf), String> {
-    let folder = final_path.parent().ok_or("it has no folder")?;
+) -> Result<SafeRelPath, String> {
     let all: Vec<&str> = target.components().collect();
     for n in 1..=MAX_NUMBERED {
         let name = aside_name(target.file_name(), stamp, n);
-        let full = folder.join(&name);
-        match fs::symlink_metadata(&full) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let mut parts: Vec<&str> = all[..all.len() - 1].to_vec();
-                parts.push(&name);
-                let rel = SafeRelPath::from_components(&parts).map_err(|e| e.to_string())?;
-                return Ok((rel, full));
-            }
+        let mut parts: Vec<&str> = all[..all.len() - 1].to_vec();
+        parts.push(&name);
+        let rel = SafeRelPath::from_components(&parts).map_err(|e| e.to_string())?;
+        match store.stat(&rel) {
+            Ok(None) => return Ok(rel),
             Err(e) => return Err(format!("could not check {name}: {e}")),
-            Ok(_) => continue,
+            Ok(Some(_)) => continue,
         }
     }
     Err("too many old copies of this file are kept beside it already; left in place".into())
@@ -1722,59 +2093,16 @@ fn changed_since_scan(entry: &PlanEntry, now: &ObjectInfo) -> Option<String> {
     None
 }
 
-/// A temporary file already at the name: a crash's is gone by now (recovery removes it), so this
-/// is one kept after a failed final move, and it may be a whole copy. It is moved aside under
-/// a numbered name, never deleted. Anything else in the way: refuse.
-fn clear_stale_temp(temp: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(temp) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("could not check {}: {e}", temp.display())),
-        Ok(m) if m.is_file() && !is_link(&m) => {
-            let stem = temp
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_suffix(TEMP_SUFFIX))
-                .unwrap_or("copy")
-                .to_string();
-            for n in 1..=MAX_NUMBERED {
-                let aside = temp.with_file_name(crate::paths::fit_name(
-                    &stem,
-                    &format!(" (kept {n}){TEMP_SUFFIX}"),
-                ));
-                match platform::rename_no_replace(temp, &aside) {
-                    Ok(()) => {
-                        warn!(
-                            "An unfinished copy was already at {}; it was moved aside to {}",
-                            temp.display(),
-                            aside.display()
-                        );
-                        return Ok(());
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                    Err(e) => {
-                        return Err(format!(
-                            "could not move the old unfinished copy {} aside: {e}",
-                            temp.display()
-                        ));
-                    }
-                }
-            }
-            Err(format!(
-                "too many unfinished copies of {stem} are already kept next to it"
-            ))
-        }
-        Ok(_) => Err(format!(
-            "{} is in the way and is not a plain file",
-            temp.display()
-        )),
-    }
-}
-
-/// Removes an unfinished temp copy this call created. If it can't be removed (an antivirus
+/// Throws away an unfinished upload this call started. If it can't be removed (an antivirus
 /// lock, permissions), the crash record is put back to a plain one and `keep_record` is set, so
 /// the record stays and the next start removes the temp.
-fn discard_temp(temp: &Path, state: &StateDir, record: &InProgress, keep_record: &mut bool) {
-    if !remove_unfinished(temp) {
+fn discard_upload(
+    upload: Box<dyn Upload>,
+    state: &StateDir,
+    record: &InProgress,
+    keep_record: &mut bool,
+) {
+    if !abort_upload(upload) {
         *keep_record = true;
         // A record of a replacement would finish it at the next start; this is only a leftover.
         if let Err(e) = state.begin_copy(record) {
@@ -1783,21 +2111,18 @@ fn discard_temp(temp: &Path, state: &StateDir, record: &InProgress, keep_record:
     }
 }
 
-/// Removes `temp`; whether it is gone. A failure is logged.
-fn remove_unfinished(temp: &Path) -> bool {
+/// Aborts `upload`; whether it is gone. A failure is logged.
+fn abort_upload(upload: Box<dyn Upload>) -> bool {
+    let shown = upload.journal_ref();
     #[cfg(test)]
     if FAIL_TEMP_REMOVAL.with(std::cell::Cell::get) {
-        warn!("Test: not removing {}", temp.display());
+        warn!("Test: not removing {shown}");
         return false;
     }
-    match fs::remove_file(temp) {
+    match upload.abort() {
         Ok(()) => true,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
         Err(e) => {
-            warn!(
-                "Could not remove the unfinished copy {}: {e}",
-                temp.display()
-            );
+            warn!("Could not remove the unfinished copy {shown}: {e}");
             false
         }
     }
@@ -1840,6 +2165,34 @@ pub(crate) fn before_temp_create(f: impl Fn(&Path) + 'static) -> impl Drop {
     Reset
 }
 
+/// Runs the `before_temp_create` hook with the temp's path, on a folder store. A file the hook
+/// leaves at that name was not made by this copy: creating the temp is refused, as the store's
+/// exclusive create would refuse it, and the file is left alone.
+#[cfg(test)]
+fn test_temp_hook(ctx: &FileCtx<'_>, target: &SafeRelPath) -> Option<String> {
+    let local = ctx.store.as_local()?;
+    let name = crate::paths::fit_name(target.file_name(), crate::paths::TEMP_SUFFIX);
+    let rel = match target.as_str().rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{name}"),
+        None => name,
+    };
+    let temp = local.root.join(rel);
+    let ran = BEFORE_TEMP_CREATE.with(|c| {
+        c.borrow().as_ref().map(|f| {
+            let had = fs::symlink_metadata(&temp).is_ok();
+            f(&temp);
+            (had, fs::symlink_metadata(&temp).is_ok())
+        })
+    });
+    match ran {
+        Some((false, true)) => Some(format!(
+            "could not create {}: it already exists",
+            temp.display()
+        )),
+        _ => None,
+    }
+}
+
 enum Stop {
     Skipped,
     Cancelled,
@@ -1852,56 +2205,31 @@ enum Stop {
 const DISK_FULL_TEXT: &str =
     "the backup disk is full, so the sync stopped here; the unfinished copy was removed";
 
-#[allow(clippy::too_many_arguments)]
-fn write_temp(
+/// Streams the device file into the upload and checks it arrived whole. Nothing is visible in
+/// the backup yet: the caller finishes the upload, or throws it away.
+fn write_upload(
     source: &mut dyn DeviceSource,
     ctx: &FileCtx<'_>,
     before: &ObjectInfo,
-    temp: &Path,
+    upload: &mut dyn Upload,
     ctl: &SyncControl,
     on_event: &mut dyn FnMut(SyncEvent),
     unfinished: &mut bool,
-    created: &mut bool,
 ) -> Result<u64, Stop> {
-    #[cfg(test)]
-    BEFORE_TEMP_CREATE.with(|c| {
-        if let Some(f) = c.borrow().as_ref() {
-            f(temp);
-        }
-    });
-    // The local file first, so a problem here never leaves a device transfer half-read.
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temp)
-        .map_err(|e| {
-            if is_disk_full(&e) {
-                Stop::DiskFull(DISK_FULL_TEXT.into())
-            } else {
-                Stop::Failed(format!("could not create {}: {e}", temp.display()))
-            }
-        })?;
-    *created = true;
     // From here until the whole file has arrived, at the size the device reported, the
     // connection is in doubt.
     *unfinished = true;
     let mut reader = source
         .open_read(&ctx.entry.object_id)
         .map_err(|e| Stop::Failed(e.to_string()))?;
-    let bytes = copy_stream(
-        &mut *reader,
-        &mut file,
-        ctl,
-        ctx.index,
-        &mut |bytes, rate| {
-            on_event(SyncEvent::Progress {
-                entry: ctx.index,
-                bytes,
-                total: ctx.entry.size,
-                bytes_per_sec: rate,
-            });
-        },
-    )?;
+    let bytes = copy_stream(&mut *reader, upload, ctl, ctx.index, &mut |bytes, rate| {
+        on_event(SyncEvent::Progress {
+            entry: ctx.index,
+            bytes,
+            total: ctx.entry.size,
+            bytes_per_sec: rate,
+        });
+    })?;
     drop(reader);
     // The whole file, or nothing.
     match ctx.entry.size {
@@ -1936,21 +2264,12 @@ fn write_temp(
             }
         }
     }
-    // The copy gets the device's modified time. Not fatal if it can't be set: the data is whole.
-    if let Some(when) = before.modified.or(ctx.entry.modified)
-        && let Err(e) = platform::set_modified(&file, when)
-    {
-        warn!(
-            "Could not set the modified date of the copy of {}: {e}",
-            ctx.entry.source
-        );
-    }
-    // On disk before it gets its real name.
-    platform::flush_file(&file).map_err(|e| {
+    // Whole and durable before anything else moves (a changed file's old copy waits for this).
+    upload.seal().map_err(|e| {
         if is_disk_full(&e) {
             Stop::DiskFull(DISK_FULL_TEXT.into())
         } else {
-            Stop::Failed(format!("could not flush the copy to disk: {e}"))
+            Stop::Failed(format!("writing to the backup failed: {e}"))
         }
     })?;
     Ok(bytes)
@@ -1959,7 +2278,7 @@ fn write_temp(
 /// `entry` is the plan entry being copied: a skip request only applies to that one.
 fn copy_stream(
     reader: &mut dyn Read,
-    out: &mut File,
+    out: &mut dyn Upload,
     ctl: &SyncControl,
     entry: usize,
     progress: &mut dyn FnMut(u64, f64),

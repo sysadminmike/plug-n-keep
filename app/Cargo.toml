@@ -38,3 +38,5 @@ rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
 
 [dev-dependencies]
 tempfile = "3"
+# The same crate with its test helpers (the S3 test cleanup); normal builds do not get them.
+pnk-core = { path = "../core", features = ["test-support"] }

@@ -16,6 +16,8 @@
 //! - [`heic`]: JPG copies of HEIC photos, and the list of the ones the app made.
 //! - [`jpgs`]: when to make them: the sync's JPG step, "Try again" and the backfill.
 //! - [`folder_record`]: a device's own record and history, kept in its backup folder.
+//! - [`bucket_settings`], [`bucket_list`]: what S3 mode keeps in the bucket: settings for every PC,
+//!   and the device list found there.
 //! - [`registry`]: the list of known devices (their records in the backup folders, pointers in
 //!   `devices.json`), and "Find my backups".
 //!
@@ -24,12 +26,15 @@
 //!
 //! `unsafe` is confined to `platform`; every other module forbids it.
 
+pub mod bucket_list;
+pub mod bucket_settings;
 pub mod device;
 pub mod folder_record;
 pub mod heic;
 pub mod history;
 pub mod idfile;
 pub mod jpgs;
+pub mod modes;
 pub mod owner;
 pub mod paths;
 pub mod plan;
@@ -39,6 +44,7 @@ pub mod registry;
 pub mod signals;
 pub mod space;
 pub mod state;
+pub mod store;
 pub mod sync;
 pub mod volume;
 

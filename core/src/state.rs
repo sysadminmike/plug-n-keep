@@ -19,6 +19,7 @@ use crate::registry::{
     ArchiveLayout, CLUTTER_NAMES, DEFAULT_ARCHIVE_NAME, DeletedFiles, DeviceSettings,
 };
 use crate::signals::{DeviceKind, Signals};
+use crate::store::{BackupStore, Destination, Kind as StoreKind, LocalStore, S3Config, Watched};
 
 /// The settings folder's name, inside the system's settings location.
 pub const APP_DIR_NAME: &str = "plug-n-keep";
@@ -66,6 +67,28 @@ impl Scope {
     }
 }
 
+impl Scope {
+    /// The scope for a backup that is not a folder: `label` (`s3://bucket/prefix`) is used as it
+    /// is, never taken for a path.
+    pub fn labelled(device_key: &str, label: &str) -> Self {
+        Self {
+            device: device_key.to_string(),
+            root: label.trim_end_matches('/').to_lowercase(),
+            dir: PathBuf::from(label),
+        }
+    }
+
+    /// The scope of a device's backup in `store`: by the folder's path for a folder, by the
+    /// label (`root` as given) for any other store.
+    pub fn in_store(device_key: &str, store: &dyn BackupStore, root: &Path) -> Self {
+        if store.as_local().is_some() {
+            Self::new(device_key, root)
+        } else {
+            Self::labelled(device_key, &root.to_string_lossy())
+        }
+    }
+}
+
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} in {}", self.device, self.root)
@@ -85,7 +108,26 @@ struct ScopeEntry {
     paths: BTreeSet<String>,
 }
 
+fn skip_rel() -> SafeRelPath {
+    SafeRelPath::parse(SKIP_NAME).expect("the skip-list name is a safe name")
+}
+
+/// A skip file's text, or the error for a damaged one (which is left as it is).
+fn parse_skip_file(name: &str, bytes: &[u8]) -> io::Result<SkipFile> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        warn!("{name} is damaged ({e}); it is left as it is");
+        io::Error::other(format!("{name} is damaged ({e}); not changing it"))
+    })
+}
+
 impl SkipFile {
+    fn empty() -> Self {
+        Self {
+            version: 2,
+            scopes: Vec::new(),
+        }
+    }
+
     /// The entry for `scope`: in a backup folder's file the device alone names it (the folder's
     /// path is wherever it is now), in the settings folder's the folder too.
     fn entry_for(&mut self, scope: &Scope, in_folder: bool) -> &mut ScopeEntry {
@@ -127,17 +169,36 @@ impl SkipFile {
 
 /// The copy in progress, written before each file and removed after it. If the app dies
 /// mid-copy, the next start finds it and cleans up.
+///
+/// The paths in a record are store-relative: `/`-separated, under `root` (the backup's folder
+/// path, which recovery checks against the folders the app holds for the device). `temp` is the
+/// upload's reference ([`crate::store::Upload::journal_ref`]): for a folder, the temp file's path
+/// under the root. A record written by an earlier release holds absolute paths instead; recovery
+/// cuts those down to the part under `root`, and acts only if they are inside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InProgress {
     pub device: String,
     pub root: PathBuf,
     /// Device path of the file being copied.
     pub source: String,
-    /// The temporary file being written.
+    /// The unfinished upload's reference (the temporary file, relative to the root).
     pub temp: PathBuf,
     /// Set once the new copy is whole and the changed-file moves may begin ([`ReplaceStep`]).
     #[serde(default)]
     pub replace: Option<ReplaceStep>,
+    /// Where the backup is when it is not a folder (`root` is then only its label). Absent for a
+    /// folder, and in records from before it: `root` is the folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<Destination>,
+}
+
+impl InProgress {
+    /// The backup this record is about.
+    pub fn place(&self) -> Destination {
+        self.destination
+            .clone()
+            .unwrap_or_else(|| Destination::Local(self.root.clone()))
+    }
 }
 
 /// Where a changed file's old copy goes (DESIGN.md section 7.3), from the device's
@@ -162,14 +223,30 @@ pub enum OldCopyGoes {
 /// or in place.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplaceStep {
-    /// Where the file is in the backup folder (the old copy, then the new one).
+    /// Where the file is in the backup (the old copy, then the new one), relative to the root.
     pub original: PathBuf,
-    /// Where the old copy goes: in the archive, or beside the original. Empty for the bin.
+    /// Where the old copy goes: in the archive, or beside the original, relative to the root.
+    /// Empty for the bin.
     #[serde(default)]
     pub archived: PathBuf,
     /// What the old copy's move is. A record from before this field is an archive move.
     #[serde(default)]
     pub goes: OldCopyGoes,
+    /// Set (to the new copy's size) when the new copy had been staged
+    /// ([`crate::store::Upload::stage`]) before the old copy moved: an object store then holds
+    /// all of it as an unfinished upload, which recovery can finish
+    /// ([`BackupStore::finish_by_ref`]). Absent when it was not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_size: Option<u64>,
+}
+
+impl InProgress {
+    /// The record of a lone move of an old copy (archiving a file that left the device, on an
+    /// object store, where a move is a copy and then a delete): a replacement record with no
+    /// upload, so `temp` is empty.
+    pub fn is_move_only(&self) -> bool {
+        self.replace.is_some() && self.temp.as_os_str().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +257,8 @@ pub struct Interrupted {
     /// and the new one in place.
     pub completed: bool,
     pub note: String,
+    /// The backup could not be reached, so the record was kept and the next start tries again.
+    pub retry_later: bool,
 }
 
 /// The app's settings, kept in `config.json`.
@@ -187,6 +266,10 @@ pub struct Interrupted {
 pub struct Config {
     #[serde(default)]
     pub backup_dir: Option<PathBuf>,
+    /// The default place in a bucket for new devices (`prefix` is the base each device's own
+    /// folder goes under), next to the default backup folder. No keys, only the profile name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_s3: Option<S3Config>,
     /// What the Log panel records. A file from before the setting, or with a value this version
     /// doesn't know, gives the default instead of failing to load.
     #[serde(default, deserialize_with = "lenient_level")]
@@ -359,16 +442,18 @@ impl StateDir {
         let name = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        match fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s).map_err(|e| {
-                warn!("{name} is damaged ({e}); it is left as it is");
-                io::Error::other(format!("{name} is damaged ({e}); not changing it"))
-            }),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(SkipFile {
-                version: 2,
-                scopes: Vec::new(),
-            }),
+        match fs::read(path) {
+            Ok(b) => parse_skip_file(&name, &b),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(SkipFile::empty()),
             Err(e) => Err(e),
+        }
+    }
+
+    /// The skip file in a backup folder; none is an empty list.
+    fn read_skip_file_in(store: &dyn BackupStore) -> io::Result<SkipFile> {
+        match store.read(&skip_rel())? {
+            Some((b, _)) => parse_skip_file(SKIP_NAME, &b),
+            None => Ok(SkipFile::empty()),
         }
     }
 
@@ -377,21 +462,20 @@ impl StateDir {
         self.write_atomic(SKIP_FILE, &json)
     }
 
-    /// Where `scope`'s skip list is kept: in the backup folder if it can hold one, else in the
-    /// settings folder (`None`).
-    fn skip_path(scope: &Scope) -> Option<PathBuf> {
-        (crate::folder_record::fit(&scope.dir, &scope.device) == crate::folder_record::Fit::Ok)
-            .then(|| scope.dir.join(SKIP_NAME))
+    /// Whether `scope`'s skip list is kept in the backup folder `store`: when it can hold one
+    /// (it is there and isn't another device's), else in the settings folder.
+    fn skip_in_backup(store: &dyn BackupStore, scope: &Scope) -> bool {
+        crate::folder_record::fit_in(store, &scope.device) == crate::folder_record::Fit::Ok
     }
 
-    /// The skip file that holds `scope`'s list, and where it is. When it is the backup folder's,
-    /// whatever the settings folder kept for this scope is taken over into it first (written to
-    /// the folder, then removed from the settings folder).
-    fn skip_load(&self, scope: &Scope) -> io::Result<(SkipFile, Option<PathBuf>)> {
-        let Some(path) = Self::skip_path(scope) else {
-            return Ok((self.read_skip_file()?, None));
-        };
-        let mut file = self.read_skip_file_at(&path)?;
+    /// The skip file that holds `scope`'s list, and whether it is the backup folder's. When it
+    /// is, whatever the settings folder kept for this scope is taken over into it first (written
+    /// to the folder, then removed from the settings folder).
+    fn skip_load(&self, scope: &Scope, store: &dyn BackupStore) -> io::Result<(SkipFile, bool)> {
+        if !Self::skip_in_backup(store, scope) {
+            return Ok((self.read_skip_file()?, false));
+        }
+        let mut file = Self::read_skip_file_in(store)?;
         let mut profile = self.read_skip_file()?;
         if let Some(i) = profile
             .scopes
@@ -401,28 +485,43 @@ impl StateDir {
             let old = profile.scopes[i].paths.clone();
             file.entry_in_folder(scope).paths.extend(old);
             let json = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
-            crate::state::write_atomic_at(&path, &json)?;
+            store.write_replace(&skip_rel(), &json, None)?;
             profile.scopes.remove(i);
             match self.write_skip_file(&profile) {
                 Ok(()) => info!("The skip list for {scope} moved into the backup folder"),
                 Err(e) => warn!("Could not take the skip list for {scope} out of {SKIP_FILE}: {e}"),
             }
         }
-        Ok((file, Some(path)))
+        Ok((file, true))
     }
 
-    fn skip_save(&self, file: &SkipFile, at: Option<&Path>) -> io::Result<()> {
+    fn skip_save(
+        &self,
+        file: &SkipFile,
+        store: &dyn BackupStore,
+        in_backup: bool,
+    ) -> io::Result<()> {
         let json = serde_json::to_vec_pretty(file).map_err(io::Error::other)?;
-        match at {
-            Some(path) => crate::state::write_atomic_at(path, &json),
-            None => self.write_atomic(SKIP_FILE, &json),
+        if in_backup {
+            store.write_replace(&skip_rel(), &json, None).map(|_| ())
+        } else {
+            self.write_atomic(SKIP_FILE, &json)
         }
     }
 
     /// The skip list for `scope` (empty if it has none).
     pub fn skip_list(&self, scope: &Scope) -> io::Result<HashSet<String>> {
-        let (file, at) = self.skip_load(scope)?;
-        let found = if at.is_some() {
+        self.skip_list_in(scope, &LocalStore::new(&scope.dir))
+    }
+
+    /// [`StateDir::skip_list`] with the backup folder held in `store`.
+    pub fn skip_list_in(
+        &self,
+        scope: &Scope,
+        store: &dyn BackupStore,
+    ) -> io::Result<HashSet<String>> {
+        let (file, in_backup) = self.skip_load(scope, store)?;
+        let found = if in_backup {
             file.scopes.iter().find(|e| e.device == scope.device)
         } else {
             file.scopes
@@ -435,19 +534,39 @@ impl StateDir {
     }
 
     pub fn skip_add(&self, scope: &Scope, path: &SafeRelPath) -> io::Result<()> {
-        let (mut file, at) = self.skip_load(scope)?;
-        file.entry_for(scope, at.is_some())
+        self.skip_add_in(scope, &LocalStore::new(&scope.dir), path)
+    }
+
+    /// [`StateDir::skip_add`] with the backup folder held in `store`.
+    pub fn skip_add_in(
+        &self,
+        scope: &Scope,
+        store: &dyn BackupStore,
+        path: &SafeRelPath,
+    ) -> io::Result<()> {
+        let (mut file, in_backup) = self.skip_load(scope, store)?;
+        file.entry_for(scope, in_backup)
             .paths
             .insert(path.as_str().to_string());
-        self.skip_save(&file, at.as_deref())?;
+        self.skip_save(&file, store, in_backup)?;
         info!("Added {path} to the skip list for {scope}");
         Ok(())
     }
 
     pub fn skip_remove(&self, scope: &Scope, path: &str) -> io::Result<()> {
-        let (mut file, at) = self.skip_load(scope)?;
-        let was_there = file.entry_for(scope, at.is_some()).paths.remove(path);
-        self.skip_save(&file, at.as_deref())?;
+        self.skip_remove_in(scope, &LocalStore::new(&scope.dir), path)
+    }
+
+    /// [`StateDir::skip_remove`] with the backup folder held in `store`.
+    pub fn skip_remove_in(
+        &self,
+        scope: &Scope,
+        store: &dyn BackupStore,
+        path: &str,
+    ) -> io::Result<()> {
+        let (mut file, in_backup) = self.skip_load(scope, store)?;
+        let was_there = file.entry_for(scope, in_backup).paths.remove(path);
+        self.skip_save(&file, store, in_backup)?;
         if was_there {
             info!("Removed {path} from the skip list for {scope}");
         } else {
@@ -457,11 +576,16 @@ impl StateDir {
     }
 
     pub fn skip_clear(&self, scope: &Scope) -> io::Result<()> {
-        let (mut file, at) = self.skip_load(scope)?;
-        let paths = &mut file.entry_for(scope, at.is_some()).paths;
+        self.skip_clear_in(scope, &LocalStore::new(&scope.dir))
+    }
+
+    /// [`StateDir::skip_clear`] with the backup folder held in `store`.
+    pub fn skip_clear_in(&self, scope: &Scope, store: &dyn BackupStore) -> io::Result<()> {
+        let (mut file, in_backup) = self.skip_load(scope, store)?;
+        let paths = &mut file.entry_for(scope, in_backup).paths;
         let n = paths.len();
         paths.clear();
-        self.skip_save(&file, at.as_deref())?;
+        self.skip_save(&file, store, in_backup)?;
         info!(
             "Cleared the skip list for {scope} ({})",
             crate::counted(n, "entry", "entries")
@@ -667,6 +791,41 @@ impl StateDir {
         &self,
         known_roots: &dyn Fn(&str) -> Vec<PathBuf>,
     ) -> io::Result<Option<Interrupted>> {
+        self.recover_interrupted_in(known_roots, &|root| Box::new(LocalStore::new(root)))
+    }
+
+    /// [`recover_interrupted`](Self::recover_interrupted), with the store that holds the backup
+    /// at the record's root.
+    pub fn recover_interrupted_in(
+        &self,
+        known_roots: &dyn Fn(&str) -> Vec<PathBuf>,
+        open_store: &dyn Fn(&Path) -> Box<dyn BackupStore>,
+    ) -> io::Result<Option<Interrupted>> {
+        self.recover_interrupted_for(
+            &|device| {
+                known_roots(device)
+                    .into_iter()
+                    .map(Destination::Local)
+                    .collect()
+            },
+            &|place| match place {
+                Destination::Local(root) => Ok(open_store(root)),
+                other => other.open(),
+            },
+        )
+    }
+
+    /// The general form: `known(device)` are the backups the app holds for the device (folders
+    /// and buckets), and `open` makes the store for one. A record is acted on only if its backup
+    /// is the same place as one of them. A backup that can't be reached keeps the record (see
+    /// [`Interrupted::retry_later`]). Afterwards the store's own unfinished uploads older than a
+    /// day are cleaned up.
+    #[allow(clippy::type_complexity)]
+    pub fn recover_interrupted_for(
+        &self,
+        known: &dyn Fn(&str) -> Vec<Destination>,
+        open: &dyn Fn(&Destination) -> Result<Box<dyn BackupStore>, String>,
+    ) -> io::Result<Option<Interrupted>> {
         let path = self.file(IN_PROGRESS_FILE);
         let text = match fs::read_to_string(&path) {
             Ok(t) => t,
@@ -678,22 +837,43 @@ impl StateDir {
         };
         let result = match serde_json::from_str::<InProgress>(&text) {
             Ok(rec) => {
-                let (temp_removed, completed, note) = if !is_known_root(&rec, known_roots) {
+                let place = rec.place();
+                let held = known(&rec.device).iter().any(|k| k.same_place(&place));
+                let (temp_removed, completed, note, retry_later) = if !held {
                     (
                         false,
                         false,
                         format!(
-                            "left everything alone: {} is not a backup folder this app holds for the device",
+                            "left everything alone: {} is not a backup this app holds for the device",
                             rec.root.display()
                         ),
+                        false,
                     )
                 } else {
-                    match &rec.replace {
-                        None => {
-                            let (removed, note) = remove_temp_if_ours(&rec);
-                            (removed, false, note)
+                    match open(&place) {
+                        Err(e) => (
+                            false,
+                            false,
+                            format!("could not open the backup {}: {e}", rec.root.display()),
+                            true,
+                        ),
+                        Ok(store) => {
+                            let watched = Watched::new(store.as_ref());
+                            let (removed, completed, note) = match &rec.replace {
+                                None => {
+                                    let (removed, note) = remove_temp_if_ours(&rec, &watched);
+                                    (removed, false, note)
+                                }
+                                Some(step) => finish_replace(&rec, step, &watched),
+                            };
+                            clean_stale(&watched);
+                            let offline = watched.offline();
+                            let note = match &offline {
+                                Some(why) => format!("{why}; {note}"),
+                                None => note,
+                            };
+                            (removed, completed, note, offline.is_some())
                         }
-                        Some(step) => finish_replace(&rec, step),
                     }
                 };
                 Interrupted {
@@ -701,6 +881,7 @@ impl StateDir {
                     temp_removed,
                     completed,
                     note,
+                    retry_later,
                 }
             }
             Err(e) => Interrupted {
@@ -708,6 +889,7 @@ impl StateDir {
                 temp_removed: false,
                 completed: false,
                 note: format!("the record of the interrupted copy was damaged ({e})"),
+                retry_later: false,
             },
         };
         match &result.record {
@@ -719,9 +901,55 @@ impl StateDir {
             ),
             None => warn!("The last copy was interrupted: {}", result.note),
         }
-        fs::remove_file(&path)?;
+        if result.retry_later {
+            warn!("The backup could not be reached; the record is kept for the next start");
+        } else {
+            fs::remove_file(&path)?;
+        }
         Ok(Some(result))
     }
+}
+
+/// How old an unfinished upload must be before start-up cleaning aborts it: a day, so another
+/// copy of the app that is uploading right now is never cut off.
+const STALE_UPLOAD_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Aborts the unfinished uploads in `store` older than a day (an object store keeps them until
+/// told). A failure is only logged.
+fn clean_stale(store: &dyn BackupStore) -> usize {
+    match store.clean_stale_uploads(STALE_UPLOAD_AGE) {
+        Ok(0) => 0,
+        Ok(n) => {
+            info!(
+                "Aborted {n} unfinished upload(s) older than a day in {}",
+                store.describe()
+            );
+            n
+        }
+        Err(e) => {
+            warn!(
+                "Could not clean up old unfinished uploads in {}: {e}",
+                store.describe()
+            );
+            0
+        }
+    }
+}
+
+/// Start-up cleaning of unfinished uploads older than a day in each of `places` that is not a
+/// folder (the backups the app holds), whether or not a crash record was left. Returns how many
+/// were aborted.
+#[allow(clippy::type_complexity)]
+pub fn clean_stale_uploads(
+    places: &[Destination],
+    open: &dyn Fn(&Destination) -> Result<Box<dyn BackupStore>, String>,
+) -> usize {
+    places
+        .iter()
+        .filter(|p| !matches!(p, Destination::Local(_)))
+        .filter_map(|p| open(p).ok())
+        .map(|s| clean_stale(s.as_ref()))
+        .sum()
 }
 
 /// Whether `path` is a plain file (not a link) that exists. `Err` if it can't be told.
@@ -737,6 +965,18 @@ fn plain_file(path: &Path) -> Result<bool, String> {
     }
 }
 
+/// Whether the file `rel` is in the store as a plain file. `Err` if it can't be told.
+fn plain_in(store: &dyn BackupStore, rel: &SafeRelPath) -> Result<bool, String> {
+    match store.stat(rel) {
+        Ok(Some(st)) if st.kind != StoreKind::File => {
+            Err(format!("{rel} is not a plain file, so nothing was changed"))
+        }
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(e) => Err(format!("could not check {rel}: {e}")),
+    }
+}
+
 /// Whether `path`'s folder resolves inside the backup folder `root`.
 fn is_inside(root: &Path, path: &Path) -> bool {
     match (
@@ -748,15 +988,49 @@ fn is_inside(root: &Path, path: &Path) -> bool {
     }
 }
 
-/// Whether the recorded backup folder is one the app holds for the recorded device.
-fn is_known_root(rec: &InProgress, known_roots: &dyn Fn(&str) -> Vec<PathBuf>) -> bool {
-    let Ok(root) = fs::canonicalize(&rec.root) else {
-        return false;
+/// The path `rel` (`/`-separated, relative to the root) under `root`.
+fn under(root: &Path, rel: &str) -> PathBuf {
+    let mut p = root.to_path_buf();
+    for c in rel.split('/') {
+        p.push(c);
+    }
+    p
+}
+
+/// On a folder store, whether the folder of `rel` still resolves inside the backup folder (no
+/// junction swapped in since). Other stores have no folders.
+fn inside_ok(store: &dyn BackupStore, rel: &str) -> bool {
+    match store.as_local() {
+        Some(local) => is_inside(&local.root, &under(&local.root, rel)),
+        None => true,
+    }
+}
+
+/// A path from a record as `/`-separated and relative to the backup folder `root`. Records hold
+/// relative paths; one written by an earlier release holds absolute paths, which are cut down to
+/// what is under the root. `None` if it is not under the root, or not a plain relative path.
+fn rel_in_root(root: &Path, p: &Path) -> Option<String> {
+    let rel = if p.is_absolute() {
+        let canon = fs::canonicalize(root).ok();
+        let cut = |base: &Path, q: &Path| q.strip_prefix(base).ok().map(Path::to_path_buf);
+        cut(root, p)
+            .or_else(|| canon.as_deref().and_then(|c| cut(c, p)))
+            .or_else(|| {
+                // Spelled another way (a short name, a link): by where its folder resolves.
+                let parent = fs::canonicalize(p.parent()?).ok()?;
+                cut(canon.as_deref()?, &parent.join(p.file_name()?))
+            })?
+    } else {
+        p.to_path_buf()
     };
-    known_roots(&rec.device)
-        .iter()
-        .filter_map(|k| fs::canonicalize(k).ok())
-        .any(|k| k == root)
+    let mut parts = Vec::new();
+    for c in rel.components() {
+        match c {
+            std::path::Component::Normal(n) => parts.push(n.to_str()?.to_string()),
+            _ => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// `temp` is `original` plus the temporary suffix, in the same folder.
@@ -771,28 +1045,40 @@ fn temp_is_originals(temp: &Path, original: &Path) -> bool {
         && t.to_lowercase() == format!("{o}{TEMP_SUFFIX}").to_lowercase()
 }
 
-/// `archived` is under `<root>/<archive name>/`, where the marker in the recorded folder names
-/// the archive and belongs to the recorded device.
-fn is_in_archive(rec: &InProgress, archived: &Path) -> bool {
-    let OwnerState::Owned(marker) = crate::owner::read(&rec.root) else {
+/// `archived` is under `<archive name>/`, where the marker in the recorded folder names the
+/// archive and belongs to the recorded device. On a folder store the archive folder, with links
+/// resolved, must also still be a folder of that name straight under the backup folder.
+fn is_in_archive(rec: &InProgress, archived: &SafeRelPath, store: &dyn BackupStore) -> bool {
+    let OwnerState::Owned(marker) = crate::owner::read_in(store) else {
         return false;
     };
-    if marker.device_id != rec.device || !is_inside(&rec.root, archived) {
+    if marker.device_id != rec.device {
         return false;
     }
+    let mut parts = archived.components();
+    let (Some(first), Some(_)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    if !marker.has_archive_name(first) {
+        return false;
+    }
+    let Some(local) = store.as_local() else {
+        return true;
+    };
     let (Some(parent), Ok(root)) = (
-        archived.parent().and_then(|p| fs::canonicalize(p).ok()),
-        fs::canonicalize(&rec.root),
+        under(&local.root, archived.as_str())
+            .parent()
+            .and_then(|p| fs::canonicalize(p).ok()),
+        fs::canonicalize(&local.root),
     ) else {
         return false;
     };
-    let Ok(rel) = parent.strip_prefix(&root) else {
-        return false;
-    };
-    rel.components()
-        .next()
+    parent
+        .strip_prefix(&root)
+        .ok()
+        .and_then(|rel| rel.components().next())
         .and_then(|c| c.as_os_str().to_str())
-        .is_some_and(|first| marker.has_archive_name(first))
+        .is_some_and(|resolved| marker.has_archive_name(resolved))
 }
 
 /// `aside` is a name beside `original` that [`crate::sync`] gives an old copy it renames: the
@@ -808,54 +1094,117 @@ fn aside_is_originals(aside: &Path, original: &Path) -> bool {
         && crate::paths::aside_original_name(a).as_deref() == Some(o)
 }
 
+/// What a replacement record names, checked: all relative to the backup folder.
+struct Places {
+    /// The unfinished upload (a temp file's path under the root on a folder store).
+    temp: String,
+    original: SafeRelPath,
+    /// Where the old copy went; `None` for the bin.
+    archived: Option<SafeRelPath>,
+}
+
+/// The upload's reference from a record: the temp file's path under the root for a folder; for
+/// any other store the reference as it was written (the store checks it is its own).
+fn temp_of(rec: &InProgress, store: &dyn BackupStore) -> Option<String> {
+    if store.as_local().is_some() {
+        rel_in_root(&rec.root, &rec.temp)
+    } else {
+        rec.temp.to_str().map(str::to_string)
+    }
+}
+
+/// The record's places, if they are the shape the app itself makes and inside the backup.
+fn places_of(rec: &InProgress, step: &ReplaceStep, store: &dyn BackupStore) -> Option<Places> {
+    let temp = temp_of(rec, store)?;
+    let original = SafeRelPath::parse(&rel_in_root(&rec.root, &step.original)?).ok()?;
+    if store.as_local().is_some()
+        && !(temp_is_originals(Path::new(&temp), Path::new(original.as_str()))
+            && inside_ok(store, &temp)
+            && inside_ok(store, original.as_str()))
+    {
+        return None;
+    }
+    let archived = match step.goes {
+        OldCopyGoes::Bin => {
+            if !step.archived.as_os_str().is_empty() {
+                return None;
+            }
+            None
+        }
+        OldCopyGoes::Archive => {
+            let a = SafeRelPath::parse(&rel_in_root(&rec.root, &step.archived)?).ok()?;
+            if !is_in_archive(rec, &a, store) || !inside_ok(store, a.as_str()) {
+                return None;
+            }
+            Some(a)
+        }
+        OldCopyGoes::Aside => {
+            let a = SafeRelPath::parse(&rel_in_root(&rec.root, &step.archived)?).ok()?;
+            if !aside_is_originals(Path::new(a.as_str()), Path::new(original.as_str()))
+                || !inside_ok(store, a.as_str())
+            {
+                return None;
+            }
+            Some(a)
+        }
+    };
+    Some(Places {
+        temp,
+        original,
+        archived,
+    })
+}
+
 /// Finish (or, where nothing had moved yet, leave) an interrupted changed-file replacement.
 /// Every move is without replacing anything, and nothing is deleted: the old copy is at
 /// `original`, or moved (to `archived`, or to the bin), the new copy at `temp` or `original`,
 /// whichever step the crash came after. Recovery never needs anything back from the bin: if the
 /// original is gone and the whole new copy is waiting, the new copy is moved into place.
 /// Returns (temp removed, completed, what was done).
-fn finish_replace(rec: &InProgress, step: &ReplaceStep) -> (bool, bool, String) {
-    let places_ok = temp_is_originals(&rec.temp, &step.original)
-        && is_inside(&rec.root, &rec.temp)
-        && is_inside(&rec.root, &step.original)
-        && match step.goes {
-            OldCopyGoes::Archive => is_in_archive(rec, &step.archived),
-            OldCopyGoes::Aside => {
-                aside_is_originals(&step.archived, &step.original)
-                    && is_inside(&rec.root, &step.archived)
-            }
-            OldCopyGoes::Bin => step.archived.as_os_str().is_empty(),
-        };
-    if !places_ok {
+fn finish_replace(
+    rec: &InProgress,
+    step: &ReplaceStep,
+    store: &dyn BackupStore,
+) -> (bool, bool, String) {
+    let Some(places) = places_of(rec, step, store) else {
         return (
             false,
             false,
             "left everything alone: the record does not match this backup folder's files and archive"
                 .into(),
         );
-    }
+    };
+    let Some(local) = store.as_local() else {
+        return finish_replace_remote(&places, step, store);
+    };
+    let temp_path = under(&local.root, &places.temp);
+    let original = &places.original;
     let bin = step.goes == OldCopyGoes::Bin;
     let state = (|| -> Result<(bool, bool, bool), String> {
         Ok((
-            plain_file(&step.original)?,
-            if bin {
-                false
-            } else {
-                plain_file(&step.archived)?
+            plain_in(store, original)?,
+            match &places.archived {
+                Some(a) if !bin => plain_in(store, a)?,
+                _ => false,
             },
-            plain_file(&rec.temp)?,
+            plain_file(&temp_path)?,
         ))
     })();
     let (orig, arch, temp) = match state {
         Ok(s) => s,
         Err(e) => return (false, false, e),
     };
-    let mv = |from: &Path, to: &Path| {
-        crate::platform::rename_no_replace(from, to).map_err(|e| {
+    let mv = |from: &SafeRelPath, to: &SafeRelPath| {
+        store
+            .move_no_replace(from, to)
+            .map_err(|e| format!("could not move {from} to {to}: {e}; both copies are kept"))
+    };
+    // The whole new copy waiting as a temporary file goes into place.
+    let mv_temp = || {
+        crate::platform::rename_no_replace(&temp_path, &original.under(&local.root)).map_err(|e| {
             format!(
-                "could not move {} to {}: {e}; both copies are kept",
-                from.display(),
-                to.display()
+                "could not move {} to {original}: {e}; both copies are kept",
+                temp_path.display()
             )
         })
     };
@@ -875,12 +1224,12 @@ fn finish_replace(rec: &InProgress, step: &ReplaceStep) -> (bool, bool, String) 
     let result = if bin {
         match (orig, temp) {
             // The old copy is gone and the new one is whole: finish the move into place.
-            (false, true) => mv(&rec.temp, &step.original).map(|()| finished),
+            (false, true) => mv_temp().map(|()| finished),
             // The old copy is still in place: nothing was moved. The unfinished new copy is
             // only a copy of the device's file, so it is removed and the next sync makes it
             // again.
             (true, true) => {
-                let (removed, note) = remove_temp_if_ours(rec);
+                let (removed, note) = remove_temp_if_ours(rec, store);
                 return (
                     removed,
                     false,
@@ -892,25 +1241,30 @@ fn finish_replace(rec: &InProgress, step: &ReplaceStep) -> (bool, bool, String) 
                     .to_string(),
             ),
             (false, false) => Err(format!(
-                "the changed file {} is gone from the backup and no new copy was left; the old copy should be in the {bin_name}",
-                step.original.display()
+                "the changed file {original} is gone from the backup and no new copy was left; the old copy should be in the {bin_name}"
             )),
         }
     } else {
+        let Some(archived) = &places.archived else {
+            return (
+                false,
+                false,
+                "left everything alone: the record has no place for the old copy".into(),
+            );
+        };
         match (orig, arch, temp) {
             // Before the first move: the old copy is in place, the whole new copy is waiting.
-            (true, false, true) => mv(&step.original, &step.archived)
-                .and_then(|()| mv(&rec.temp, &step.original))
+            (true, false, true) => mv(original, archived)
+                .and_then(|()| mv_temp())
                 .map(|()| finished),
             // After the first move.
-            (false, true, true) => mv(&rec.temp, &step.original).map(|()| finished),
+            (false, true, true) => mv_temp().map(|()| finished),
             // After both moves.
             (true, true, false) => Ok(format!(
                 "the changed file had been replaced: the old copy is {where_old} and the new one is in place"
             )),
             _ => Err(format!(
-                "the changed file {} was left as it is (the old copy {}, the moved copy {}, the new copy {}); nothing was deleted",
-                step.original.display(),
+                "the changed file {original} was left as it is (the old copy {}, the moved copy {}, the new copy {}); nothing was deleted",
                 if orig { "is there" } else { "is missing" },
                 if arch { "is there" } else { "is missing" },
                 if temp { "is there" } else { "is missing" },
@@ -923,9 +1277,152 @@ fn finish_replace(rec: &InProgress, step: &ReplaceStep) -> (bool, bool, String) 
     }
 }
 
-/// Delete `rec.temp` only if it is plainly this app's temporary file: our suffix, a regular
-/// file (not a link), inside the recorded backup folder.
-fn remove_temp_if_ours(rec: &InProgress) -> (bool, String) {
+/// What was found of the old copy of an interrupted replacement (or move) on an object store.
+enum OldFound {
+    /// Still in place: nothing moved.
+    InPlace,
+    /// Moved: only the moved copy is there.
+    Moved,
+    /// Both were there, and the original was removed because the copy was shown to match.
+    OriginalRemoved,
+    /// Both are there and stay; why.
+    BothKept(String),
+    /// Neither is there.
+    Gone,
+    /// Could not tell.
+    Unknown(String),
+}
+
+/// An interrupted replacement in a store whose unfinished uploads are invisible. The old copy is
+/// where it was or moved. A move cut between its copy and its delete leaves both; the original
+/// is then deleted only if the store shows the moved copy has the same size and modified time
+/// ([`BackupStore::remove_verified_original`]), else both stay.
+///
+/// The new copy: when it had been staged (`step.staged_size`) and the old copy is out of the
+/// way, the store holds all of it, so it is finished into place ([`BackupStore::finish_by_ref`])
+/// and the replacement is done, like the roll forward on a folder. Otherwise, or if that does
+/// not work, the upload is dropped and the next sync copies the file again (it is on the device).
+/// A record with no upload (a lone move) only deals with the old copy.
+fn finish_replace_remote(
+    places: &Places,
+    step: &ReplaceStep,
+    store: &dyn BackupStore,
+) -> (bool, bool, String) {
+    let move_only = places.temp.is_empty();
+    let orig = plain_in(store, &places.original);
+    let arch = match &places.archived {
+        Some(a) => plain_in(store, a),
+        None => Ok(false),
+    };
+    let where_old = match step.goes {
+        OldCopyGoes::Aside => "renamed beside it",
+        _ => "in the archive",
+    };
+    let old = match (orig, arch) {
+        (Ok(true), Ok(false)) => OldFound::InPlace,
+        (Ok(false), Ok(true)) => OldFound::Moved,
+        (Ok(true), Ok(true)) => {
+            let copy = places.archived.as_ref().expect("a copy that was found");
+            match store.remove_verified_original(&places.original, copy) {
+                Ok(true) => OldFound::OriginalRemoved,
+                Ok(false) => {
+                    OldFound::BothKept(format!("the one {where_old} could not be shown to match"))
+                }
+                Err(e) => OldFound::BothKept(e.to_string()),
+            }
+        }
+        (Ok(false), Ok(false)) => OldFound::Gone,
+        (Err(e), _) | (_, Err(e)) => OldFound::Unknown(e),
+    };
+    let both_kept = |why: &str| {
+        format!(
+            "the old copy's move was cut short: both copies exist ({why}), so both were left as they are"
+        )
+    };
+    if move_only {
+        let note = match &old {
+            OldFound::InPlace => {
+                "the old copy had not been moved, so it was left in place".to_string()
+            }
+            OldFound::Moved => format!("the old copy is {where_old}"),
+            OldFound::OriginalRemoved => format!(
+                "the old copy's move was cut short: the copy {where_old} has the same size and date, so the original was removed"
+            ),
+            OldFound::BothKept(why) => both_kept(why),
+            OldFound::Gone => format!("{} is gone from the backup", places.original),
+            OldFound::Unknown(e) => e.clone(),
+        };
+        return (false, false, note);
+    }
+    // The new copy goes into place only when the old one is out of the way.
+    let away = matches!(old, OldFound::Moved | OldFound::OriginalRemoved);
+    let mut finish_failed = None;
+    if away && let Some(size) = step.staged_size {
+        match store.finish_by_ref(&places.temp, size) {
+            Ok(_) => {
+                let how = if matches!(old, OldFound::OriginalRemoved) {
+                    "the old copy's move was cut short and was finished: "
+                } else {
+                    ""
+                };
+                return (
+                    false,
+                    true,
+                    format!(
+                        "finished replacing the changed file: {how}the old copy is {where_old} and the new one, which was whole in the store, is in place"
+                    ),
+                );
+            }
+            Err(e) => finish_failed = Some(e),
+        }
+    }
+    let aborted = store.abort_by_ref(&places.temp);
+    let mut dropped = match &aborted {
+        Ok(()) => "the unfinished upload was dropped".to_string(),
+        Err(e) => format!("the unfinished upload could not be dropped ({e})"),
+    };
+    if let Some(e) = finish_failed {
+        dropped = format!("it could not be finished ({e}); {dropped}");
+    }
+    let note = match &old {
+        OldFound::InPlace => {
+            format!("the old copy had not been moved, so it was left in place; {dropped}")
+        }
+        OldFound::Moved => format!(
+            "the old copy is {where_old} and the new copy was not finished; {dropped}, and the next sync copies the file again"
+        ),
+        OldFound::OriginalRemoved => format!(
+            "the old copy's move was cut short: the copy {where_old} has the same size and date, so the original was removed; {dropped}, and the next sync copies the file again"
+        ),
+        OldFound::BothKept(why) => format!("{}; {dropped}", both_kept(why)),
+        OldFound::Gone => format!(
+            "the changed file {} is gone from the backup and no new copy was finished; {dropped}",
+            places.original
+        ),
+        OldFound::Unknown(e) => format!("{e}; {dropped}"),
+    };
+    (aborted.is_ok(), false, note)
+}
+
+/// Remove the unfinished copy `rec.temp` only if it is plainly this app's temporary file: our
+/// suffix, a regular file (not a link), inside the recorded backup folder. In a store without
+/// files, the upload it names is dropped (the store refuses anything that is not this app's).
+fn remove_temp_if_ours(rec: &InProgress, store: &dyn BackupStore) -> (bool, String) {
+    let Some(local) = store.as_local() else {
+        let Some(temp) = temp_of(rec, store) else {
+            return (
+                false,
+                format!(
+                    "left {} alone: not an upload of this app",
+                    rec.temp.display()
+                ),
+            );
+        };
+        return match store.abort_by_ref(&temp) {
+            Ok(()) => (true, format!("dropped the unfinished upload {temp}")),
+            Err(e) => (false, format!("could not drop the upload {temp}: {e}")),
+        };
+    };
     let name_ok = rec
         .temp
         .file_name()
@@ -940,32 +1437,7 @@ fn remove_temp_if_ours(rec: &InProgress) -> (bool, String) {
             ),
         );
     }
-    let meta = match fs::symlink_metadata(&rec.temp) {
-        Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return (false, "no temporary file was left".into());
-        }
-        Err(e) => {
-            return (
-                false,
-                format!("could not check {}: {e}", rec.temp.display()),
-            );
-        }
-    };
-    if is_link(&meta) || !meta.is_file() {
-        return (
-            false,
-            format!("left {} alone: not a plain file", rec.temp.display()),
-        );
-    }
-    let inside = match (
-        rec.temp.parent().and_then(|p| fs::canonicalize(p).ok()),
-        fs::canonicalize(&rec.root).ok(),
-    ) {
-        (Some(parent), Some(root)) => parent.starts_with(&root),
-        _ => false,
-    };
-    if !inside {
+    let Some(temp) = rel_in_root(&rec.root, &rec.temp) else {
         return (
             false,
             format!(
@@ -973,16 +1445,38 @@ fn remove_temp_if_ours(rec: &InProgress) -> (bool, String) {
                 rec.temp.display()
             ),
         );
+    };
+    let path = under(&local.root, &temp);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return (false, "no temporary file was left".into());
+        }
+        Err(e) => {
+            return (false, format!("could not check {}: {e}", path.display()));
+        }
+    };
+    if is_link(&meta) || !meta.is_file() {
+        return (
+            false,
+            format!("left {} alone: not a plain file", path.display()),
+        );
     }
-    match fs::remove_file(&rec.temp) {
+    if !inside_ok(store, &temp) {
+        return (
+            false,
+            format!(
+                "left {} alone: not inside the backup folder",
+                path.display()
+            ),
+        );
+    }
+    match store.abort_by_ref(&temp) {
         Ok(()) => (
             true,
-            format!("removed the unfinished copy {}", rec.temp.display()),
+            format!("removed the unfinished copy {}", path.display()),
         ),
-        Err(e) => (
-            false,
-            format!("could not remove {}: {e}", rec.temp.display()),
-        ),
+        Err(e) => (false, format!("could not remove {}: {e}", path.display())),
     }
 }
 
@@ -995,6 +1489,77 @@ impl InstanceLock {
     /// `Ok(None)` if another instance holds the lock.
     pub fn acquire(state: &StateDir) -> io::Result<Option<Self>> {
         Ok(crate::platform::acquire_lock(&state.file(INSTANCE_FILE))?.map(|f| Self { _file: f }))
+    }
+}
+
+#[cfg(test)]
+mod skip_store_tests {
+    use super::*;
+    use crate::store::mem::MemStore;
+
+    fn state() -> (tempfile::TempDir, StateDir) {
+        let t = tempfile::tempdir().unwrap();
+        let s = StateDir::open(t.path().join("state")).unwrap();
+        (t, s)
+    }
+
+    fn p(s: &str) -> SafeRelPath {
+        SafeRelPath::parse(s).unwrap()
+    }
+
+    fn scope() -> Scope {
+        Scope::new("dev", Path::new("/not/used"))
+    }
+
+    #[test]
+    fn the_list_lives_in_the_backup_store_and_travels_with_it() {
+        let (_t, s) = state();
+        let mem = MemStore::new();
+        let sc = scope();
+        assert!(s.skip_list_in(&sc, &mem).unwrap().is_empty());
+        s.skip_add_in(&sc, &mem, &p("DCIM/a.jpg")).unwrap();
+        s.skip_add_in(&sc, &mem, &p("DCIM/b.jpg")).unwrap();
+        assert_eq!(mem.keys(), [SKIP_NAME]);
+        assert_eq!(s.skip_list_in(&sc, &mem).unwrap().len(), 2);
+        s.skip_remove_in(&sc, &mem, "DCIM/a.jpg").unwrap();
+        assert_eq!(
+            s.skip_list_in(&sc, &mem).unwrap(),
+            HashSet::from(["DCIM/b.jpg".to_string()])
+        );
+        s.skip_clear_in(&sc, &mem).unwrap();
+        assert!(s.skip_list_in(&sc, &mem).unwrap().is_empty());
+        // Nothing was kept in the settings folder.
+        assert!(!s.file(SKIP_FILE).exists());
+    }
+
+    #[test]
+    fn the_settings_folders_list_moves_into_the_store_once() {
+        let (_t, s) = state();
+        let sc = scope();
+        let other = MemStore::new();
+        other.insert(
+            crate::owner::MARKER,
+            br#"{"device_id":"someone else","device_name":"x"}"#,
+            None,
+        );
+        // Another device's folder: the list stays in the settings folder.
+        s.skip_add_in(&sc, &other, &p("old.jpg")).unwrap();
+        assert!(other.get(SKIP_NAME).is_none());
+        assert!(s.file(SKIP_FILE).exists());
+        // A folder that fits takes it over.
+        let mem = MemStore::new();
+        assert!(s.skip_list_in(&sc, &mem).unwrap().contains("old.jpg"));
+        assert!(mem.get(SKIP_NAME).is_some());
+        assert!(s.skip_list_in(&sc, &other).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_damaged_list_in_the_store_is_reported_and_left_alone() {
+        let (_t, s) = state();
+        let mem = MemStore::new();
+        mem.insert(SKIP_NAME, b"{ nope", None);
+        assert!(s.skip_add_in(&scope(), &mem, &p("a.jpg")).is_err());
+        assert_eq!(mem.get(SKIP_NAME).unwrap(), b"{ nope");
     }
 }
 
@@ -1056,6 +1621,7 @@ mod tests {
             backup_dir: Some(PathBuf::from(r"D:\Photos\Backup")),
             log_level: LogLevel::Debug,
             new_devices: NewDeviceDefaults::default(),
+            default_s3: None,
         };
         s.save_config(&c).unwrap();
         assert_eq!(s.config(), c);
@@ -1289,6 +1855,7 @@ mod tests {
             source: "DCIM/IMG_1.HEIC".into(),
             temp: temp.clone(),
             replace: None,
+            destination: None,
         };
         s.begin_copy(&rec).unwrap();
         let got = s
@@ -1326,6 +1893,7 @@ mod tests {
                 source: "x".into(),
                 temp,
                 replace: None,
+                destination: None,
             })
             .unwrap();
             let got = s
