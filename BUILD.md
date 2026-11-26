@@ -33,6 +33,13 @@ folder:
 cargo run --features plug-n-keep/fake-device -- --fake-device <folder> --state-dir <folder>
 ```
 
+## Releases
+
+Pushing a tag `vX.Y.Z` builds the Windows and Linux downloads and publishes them as a GitHub
+Release, with checksums, through `.github/workflows/release.yml`. A tag with a hyphen (`v0.2.0-rc1`)
+is marked as a pre-release. Running the workflow by hand only uploads the files as workflow
+artifacts.
+
 ## Windows
 
 The repository does not pin a Windows target, so it builds for your Rust installation's default

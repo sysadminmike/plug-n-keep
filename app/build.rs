@@ -4,12 +4,13 @@
 //! `pnk-version.h` in OUT_DIR that assets/app.rc includes.
 //!
 //! assets/app.rc is compiled with `windres` on the GNU toolchain, or `rc.exe` on MSVC; set
-//! `WINDRES` or `RC` to use a particular one. If neither is found, the build still succeeds,
+//! `WINDRES` or `RC` to use a particular one. On MSVC, if `rc` isn't on PATH, the newest Windows 10/11
+//! SDK's `rc.exe` is used. If neither is found, the build still succeeds,
 //! with a warning, and the exe just has no file icon.
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -29,19 +30,30 @@ fn main() {
 
     let compiled = if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         let out = out_dir.join("app.res");
-        let tool = env::var("RC").unwrap_or_else(|_| "rc".into());
-        Command::new(&tool)
-            .arg("/nologo")
-            .arg("/i")
-            .arg(&assets)
-            .arg("/i")
-            .arg(&out_dir)
-            .arg("/fo")
-            .arg(&out)
-            .arg(&rc)
-            .status()
-            .map(|s| s.success().then_some(out))
-            .map_err(|e| format!("{tool}: {e}"))
+        let run = |tool: &Path| {
+            Command::new(tool)
+                .arg("/nologo")
+                .arg("/i")
+                .arg(&assets)
+                .arg("/i")
+                .arg(&out_dir)
+                .arg("/fo")
+                .arg(&out)
+                .arg(&rc)
+                .status()
+        };
+        let named = env::var_os("RC");
+        let mut result = run(Path::new(named.as_deref().unwrap_or("rc".as_ref())));
+        // Outside a Visual Studio shell rc.exe isn't on PATH; fall back to the Windows SDK's.
+        if named.is_none()
+            && matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            && let Some(sdk_rc) = find_sdk_rc()
+        {
+            result = run(&sdk_rc);
+        }
+        result
+            .map(|s| s.success().then_some(out.clone()))
+            .map_err(|e| format!("rc: {e}"))
     } else {
         let out = out_dir.join("app-res.o");
         let tool = env::var("WINDRES").unwrap_or_else(|_| "windres".into());
@@ -91,4 +103,21 @@ fn write_version_header(out_dir: &std::path::Path) {
         version
     );
     std::fs::write(out_dir.join("pnk-version.h"), header).expect("write pnk-version.h");
+}
+
+/// The newest `rc.exe` under `%ProgramFiles(x86)%\Windows Kits\10\bin\<version>\x64`.
+fn find_sdk_rc() -> Option<PathBuf> {
+    let bin = PathBuf::from(env::var_os("ProgramFiles(x86)")?).join(r"Windows Kits\10\bin");
+    let version_key =
+        |name: &str| -> Vec<u32> { name.split('.').map_while(|p| p.parse().ok()).collect() };
+    std::fs::read_dir(bin)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let rc = e.path().join(r"x64\rc.exe");
+            let key = version_key(&e.file_name().to_string_lossy());
+            (!key.is_empty() && rc.is_file()).then_some((key, rc))
+        })
+        .max()
+        .map(|(_, rc)| rc)
 }

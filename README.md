@@ -60,6 +60,8 @@ folders and you have backed up everything.
 
 ## Build
 
+Ready-made builds for Windows and Linux are on the [Releases](https://github.com/sysadminmike/plug-n-keep/releases) page.
+
 ```text
 cargo build --release
 ```
