@@ -58,9 +58,38 @@ folders and you have backed up everything.
 3. Click **Add an existing backup…** and pick the folder. Each device comes back with its settings
    and history.
 
-## Build
+## Download
 
 Ready-made builds for Windows and Linux are on the [Releases](https://github.com/sysadminmike/plug-n-keep/releases) page.
+
+**Windows:** unzip and run `plug-n-keep.exe`. The exe isn't code-signed yet, so the first time
+Windows SmartScreen may say "Windows protected your PC": click **More info**, then **Run anyway**.
+
+**Linux** (x86_64, glibc 2.35 or newer, such as Ubuntu 22.04 and later): fetch the latest release
+and unpack it.
+
+```sh
+v=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/sysadminmike/plug-n-keep/releases/latest); v=${v##*/v}
+curl -fsSL "https://github.com/sysadminmike/plug-n-keep/releases/download/v$v/plug-n-keep-$v-linux-x86_64.tar.gz" | tar -xz
+./plug-n-keep-$v/plug-n-keep
+```
+
+To install it for your user, `install -m 755 plug-n-keep-$v/plug-n-keep ~/.local/bin/`. Phone and
+camera support needs a few optional packages; see [BUILD.md](BUILD.md#linux).
+
+**FreeBSD:** there is no ready-made build yet, and FreeBSD support is so far only checked to
+compile, not tested on a real machine. Fetch the latest source and build it (needs Rust 1.100 or
+newer, from `pkg install rust` or rustup; see [BUILD.md](BUILD.md#freebsd)):
+
+```sh
+v=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/sysadminmike/plug-n-keep/releases/latest); v=${v##*/v}
+curl -fsSL "https://github.com/sysadminmike/plug-n-keep/archive/refs/tags/v$v.tar.gz" | tar -xz
+cd plug-n-keep-$v && cargo build --release && ./target/release/plug-n-keep
+```
+
+Checksums for each release are in its `SHA256SUMS.txt`.
+
+## Build
 
 ```text
 cargo build --release
